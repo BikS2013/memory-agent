@@ -1,0 +1,28 @@
+# LLM Configuration for Always-On Memory Agent
+# Copy this file to llm-config.yaml and update values.
+# Set the LLM_CONFIG_PATH environment variable to the absolute path of your config file.
+
+llm:
+  # Active LLM provider: "openai" | "anthropic" | "google"
+  provider: "openai"
+
+  # Model identifier (e.g., "gpt-4", "claude-sonnet-4-20250514", "gemini-2.0-flash")
+  model: "gpt-4"
+
+  # Temperature for LLM responses (0.0 - 2.0)
+  temperature: 0.0
+
+  # OpenAI configuration (required when provider is "openai")
+  openai:
+    apiKey: "sk-your-openai-api-key-here"
+    # organization: "org-..."   # OPTIONAL
+    # baseUrl: "https://..."    # OPTIONAL - for Azure OpenAI or custom endpoints
+
+  # Anthropic configuration (required when provider is "anthropic")
+  # anthropic:
+  #   apiKey: "sk-ant-your-anthropic-api-key-here"
+  #   baseUrl: "https://..."    # OPTIONAL - for custom endpoints
+
+  # Google configuration (required when provider is "google")
+  # google:
+  #   apiKey: "AIza-your-google-api-key-here"

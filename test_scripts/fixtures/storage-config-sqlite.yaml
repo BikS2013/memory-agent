@@ -1,0 +1,4 @@
+storage:
+  provider: sqlite
+  sqlite:
+    databasePath: ":memory:"

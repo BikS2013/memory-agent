@@ -16,7 +16,7 @@ export function registerRoutes(fastify: FastifyInstance, deps: ServerDependencie
   // GET /status - Returns system status and statistics
   fastify.get('/status', async (_request, reply) => {
     try {
-      const stats = memoryRepo.getStats();
+      const stats = await memoryRepo.getStats();
       const uptime = Math.floor((Date.now() - serverStartTime) / 1000);
 
       return reply.send({
@@ -35,7 +35,7 @@ export function registerRoutes(fastify: FastifyInstance, deps: ServerDependencie
   // GET /memories - Returns all stored memories
   fastify.get('/memories', async (_request, reply) => {
     try {
-      const memories = memoryRepo.getAll();
+      const memories = await memoryRepo.getAll();
       return reply.send({ memories });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -120,7 +120,7 @@ export function registerRoutes(fastify: FastifyInstance, deps: ServerDependencie
     async (request, reply) => {
       try {
         const { id } = request.body;
-        const deleted = memoryRepo.deleteById(id);
+        const deleted = await memoryRepo.deleteById(id);
 
         return reply.send({
           status: deleted ? 'deleted' : 'not_found',
@@ -136,8 +136,8 @@ export function registerRoutes(fastify: FastifyInstance, deps: ServerDependencie
   // POST /clear - Clears all memories and consolidations
   fastify.post('/clear', async (_request, reply) => {
     try {
-      const memoriesCleared = memoryRepo.deleteAll();
-      const consolidationsCleared = consolidationRepo.deleteAll();
+      const memoriesCleared = await memoryRepo.deleteAll();
+      const consolidationsCleared = await consolidationRepo.deleteAll();
 
       return reply.send({
         status: 'cleared',

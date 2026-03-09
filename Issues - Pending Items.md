@@ -2,6 +2,21 @@
 
 ## Pending Items
 
+### P10 - validateConfig() is exported but never called
+**Severity**: Low
+**Location**: `src/config/validation.ts` (line 13), `src/config/index.ts` (not exported)
+**Description**: The `validateConfig()` function validates `AppConfig` fields (watchDirectory, apiPort, consolidationIntervalMs), but it is never imported or called anywhere in the codebase. The `loadConfig()` function in `config.ts` already performs equivalent inline validation for these fields before returning the config object. This makes `validateConfig()` dead code. It should either be called after `loadConfig()` as a defense-in-depth measure, removed entirely, or at minimum not confuse future maintainers.
+
+### P11 - Azure Blob ID generation is not globally atomic across time-period blobs
+**Severity**: Medium
+**Location**: `src/database/azure-blob/azure-blob-memory-repository.ts` (insert method), `src/database/azure-blob/azure-blob-consolidation-repository.ts` (insert method)
+**Description**: The `insert()` methods compute a global max ID by scanning all time-period blobs, then use `readModifyWrite` on the target blob. Under concurrent inserts that target *different* time-period blobs, two writers can simultaneously read the same global max and generate the same next ID, since `readModifyWrite` ETag protection only covers a single blob. This is acceptable for single-user low-concurrency scenarios but could cause duplicate IDs under high concurrency across period boundaries. A dedicated index blob or UUID-based IDs would fully solve this.
+
+### P12 - Azure Blob markConsolidated writes to ALL period blobs unconditionally
+**Severity**: Low
+**Location**: `src/database/azure-blob/azure-blob-memory-repository.ts` (markConsolidated method)
+**Description**: The `markConsolidated()` method iterates all time-period blobs and performs a `readModifyWrite` on each, even if none of the target IDs exist in that blob. This triggers unnecessary writes (and ETag checks) on blobs that have no matching IDs, increasing latency and Azure API call costs proportionally to the number of time periods.
+
 ### P1 - Design Deviations: ConnectionEntry interface mismatch
 **Severity**: Medium
 **Location**: `src/database/types.ts` (line 85-89)
@@ -51,6 +66,30 @@
 ---
 
 ## Completed Items
+
+### C6 - FIXED: SQL Server getAll() ordered by createdAt DESC instead of id ASC
+**Severity**: Medium
+**Location**: `src/database/sqlserver/sqlserver-memory-repository.ts` (line 49)
+**Description**: The `getAll()` method used `ORDER BY createdAt DESC` while the `IMemoryRepository` interface contract specifies "ordered by id ascending" and the SQLite implementation uses `ORDER BY id ASC`. This caused inconsistent behavior across storage backends.
+**Fix**: Changed query to `ORDER BY id ASC` to match the interface contract and SQLite behavior.
+
+### C7 - FIXED: Azure Blob writeJsonBlob missing ifNoneMatch for new blob creation
+**Severity**: Medium
+**Location**: `src/database/azure-blob/blob-helpers.ts` (writeJsonBlob function)
+**Description**: When `etag` was undefined (blob didn't exist yet), `writeJsonBlob` passed no conditions, allowing a concurrent creator to be silently overwritten. This broke the optimistic concurrency guarantee of the `readModifyWrite` pattern for first-write scenarios.
+**Fix**: Added `ifNoneMatch: '*'` condition when no ETag is present, ensuring a 412 error if the blob was concurrently created between read and write.
+
+### C8 - FIXED: Azure Blob insert() race condition on ID generation
+**Severity**: Medium
+**Location**: `src/database/azure-blob/azure-blob-memory-repository.ts`, `src/database/azure-blob/azure-blob-consolidation-repository.ts`
+**Description**: The `insert()` methods called `getNextId()` before `readModifyWrite()`, so the ID was computed outside the atomic read-modify-write cycle. Two concurrent inserts into the same blob could both compute the same next ID. The blob-local items were not considered when generating the ID.
+**Fix**: Moved ID computation inside the `readModifyWrite` callback, using `Math.max(globalMax, localMax + 1)` where `globalMax` is pre-computed from all periods and `localMax` is derived from the blob-local items at write time.
+
+### C9 - FIXED: Azure Blob updateConnections/deleteById TOCTOU race condition
+**Severity**: Medium
+**Location**: `src/database/azure-blob/azure-blob-memory-repository.ts` (updateConnections, deleteById)
+**Description**: Both methods performed a separate `readJsonBlob` to check if the target ID existed, then did a separate `readModifyWrite` to modify. Between the check and the write, the blob could have changed (item moved, deleted, or blob replaced). This is a classic Time-of-Check-Time-of-Use (TOCTOU) race.
+**Fix**: Consolidated the existence check into the `readModifyWrite` callback, using a `found` flag set within the atomic modifier function. This ensures the check and modification happen against the same blob snapshot.
 
 ### C5 - FIXED: CLAUDE.md missing tool documentation (AC-08)
 **Severity**: Medium

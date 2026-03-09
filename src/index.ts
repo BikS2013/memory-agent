@@ -1,17 +1,10 @@
 import { loadConfig } from './config/index.js';
-import {
-  initializeDatabase,
-  closeDatabase,
-  MemoryRepository,
-  ConsolidationRepository,
-  ProcessedFileRepository,
-} from './database/index.js';
+import { createStorage } from './database/storage-factory.js';
 import { createLlm } from './llm/index.js';
 import { IngestAgent, ConsolidateAgent, QueryAgent } from './agents/index.js';
 import { createServer, startServer, stopServer } from './api/index.js';
 import { FileWatcher } from './watcher/index.js';
 import { ConsolidationLoop } from './consolidation/index.js';
-import type Database from 'better-sqlite3';
 import type { FastifyInstance } from 'fastify';
 
 async function main(): Promise<void> {
@@ -19,16 +12,14 @@ async function main(): Promise<void> {
   const config = loadConfig();
   console.log('Configuration loaded successfully');
 
-  // Step 2: Initialize database
-  const db: Database.Database = initializeDatabase(config.databasePath);
-  const memoryRepo = new MemoryRepository(db);
-  const consolidationRepo = new ConsolidationRepository(db);
-  const processedFileRepo = new ProcessedFileRepository(db);
-  console.log(`Database initialized: ${config.databasePath}`);
+  // Step 2: Initialize storage via factory
+  const storage = await createStorage(config.storage);
+  const { memoryRepo, consolidationRepo, processedFileRepo } = storage;
+  console.log(`Storage initialized: ${config.storage.provider}`);
 
   // Step 3: Create LLM instance
   const llm = createLlm(config);
-  console.log(`LLM configured: ${config.llmProvider}/${config.llmModel}`);
+  console.log(`LLM configured: ${config.llm.provider}/${config.llm.model}`);
 
   // Step 4: Create agents
   const ingestAgent = new IngestAgent(llm, memoryRepo);
@@ -61,8 +52,8 @@ async function main(): Promise<void> {
   console.log('Always-On Memory Agent started successfully');
   console.log(`  HTTP API:       http://localhost:${config.apiPort}`);
   console.log(`  Watching:       ${config.watchDirectory}`);
-  console.log(`  Database:       ${config.databasePath}`);
-  console.log(`  LLM:            ${config.llmProvider}/${config.llmModel}`);
+  console.log(`  Storage:        ${config.storage.provider}`);
+  console.log(`  LLM:            ${config.llm.provider}/${config.llm.model}`);
   console.log(`  Consolidation:  every ${config.consolidationIntervalMs}ms`);
 
   // Step 9: Register signal handlers
@@ -78,7 +69,7 @@ async function main(): Promise<void> {
     await stopServer(server);
     console.log('HTTP server stopped');
 
-    closeDatabase(db);
+    await storage.close();
     console.log('Database connection closed');
 
     console.log('Shutdown complete');

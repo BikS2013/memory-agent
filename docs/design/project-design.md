@@ -2395,3 +2395,1747 @@ test-*.db
 | Environment variables | UPPER_SNAKE_CASE | `LLM_PROVIDER`, `DATABASE_PATH` |
 | API endpoints | lowercase with slashes | `/status`, `/memories`, `/query` |
 | Topic tags | lowercase hyphenated | `ui-preferences`, `development-tools` |
+
+---
+
+## Enhancement: Multi-Storage Backend & YAML Configuration
+
+**Version**: 2.0 Addendum
+**Created**: 2026-03-09
+**Status**: Approved for Implementation
+**Prerequisite Documents**:
+- [Refined Request](../reference/refined-request-multi-storage-llm-config.md)
+- [Plan 002](./plan-002-multi-storage-llm-config.md)
+- [Technical Investigation](../reference/investigation-multi-storage-llm-config.md)
+
+### Table of Contents (Addendum)
+
+1. [E1. YAML Configuration Schemas](#e1-yaml-configuration-schemas)
+2. [E2. Repository Interfaces](#e2-repository-interfaces)
+3. [E3. Restructured AppConfig](#e3-restructured-appconfig)
+4. [E4. SQLite Backend Refactor](#e4-sqlite-backend-refactor)
+5. [E5. SQL Server Backend](#e5-sql-server-backend)
+6. [E6. Azure Blob Storage Backend](#e6-azure-blob-storage-backend)
+7. [E7. Storage Factory](#e7-storage-factory)
+8. [E8. Updated LLM Factory](#e8-updated-llm-factory)
+9. [E9. Updated Module Organization](#e9-updated-module-organization)
+10. [E10. Parallel Implementation Units](#e10-parallel-implementation-units)
+
+---
+
+### E1. YAML Configuration Schemas
+
+Both YAML configuration files are loaded at startup, parsed with `js-yaml`, and validated with Zod. The path to each file is read from a mandatory environment variable. Missing env vars or invalid YAML content causes an immediate startup exception with a descriptive message.
+
+#### E1.1 Storage Configuration Schema (`storage-config.yaml`)
+
+**Environment variable**: `STORAGE_CONFIG_PATH` (absolute path, required, no fallback)
+
+**YAML structure**:
+
+```yaml
+storage:
+  provider: "sqlite" | "sqlserver" | "azure-blob"
+  sqlite:
+    databasePath: "./data/memories.db"
+  sqlserver:
+    server: "localhost"
+    port: 1433
+    database: "MemoryAgent"
+    user: "sa"
+    password: "secret"
+    encrypt: true
+    trustServerCertificate: false
+  azure-blob:
+    authMethod: "connection-string" | "azure-identity"
+    connectionString: "DefaultEndpointsProtocol=https;..."
+    accountName: "mystorageaccount"
+    containerName: "memories"
+    timePeriodFormat: "monthly" | "weekly" | "daily"
+```
+
+**Complete Zod schema**:
+
+```typescript
+import { z } from 'zod';
+
+// --- Sub-schemas for each storage provider ---
+
+const sqliteConfigSchema = z.object({
+  databasePath: z.string().min(1, 'sqlite.databasePath is required'),
+});
+
+const sqlServerConfigSchema = z.object({
+  server: z.string().min(1, 'sqlserver.server is required'),
+  port: z.number().int().min(1).max(65535, 'sqlserver.port must be 1-65535'),
+  database: z.string().min(1, 'sqlserver.database is required'),
+  user: z.string().min(1, 'sqlserver.user is required'),
+  password: z.string().min(1, 'sqlserver.password is required'),
+  encrypt: z.boolean({ required_error: 'sqlserver.encrypt is required' }),
+  trustServerCertificate: z.boolean({
+    required_error: 'sqlserver.trustServerCertificate is required',
+  }),
+});
+
+const azureBlobConfigSchema = z
+  .object({
+    authMethod: z.enum(['connection-string', 'azure-identity'], {
+      required_error:
+        'azure-blob.authMethod must be "connection-string" or "azure-identity"',
+    }),
+    connectionString: z.string().min(1).optional(),
+    accountName: z.string().min(1).optional(),
+    containerName: z.string().min(1, 'azure-blob.containerName is required'),
+    timePeriodFormat: z.enum(['monthly', 'weekly', 'daily'], {
+      required_error:
+        'azure-blob.timePeriodFormat must be "monthly", "weekly", or "daily"',
+    }),
+  })
+  .refine(
+    (data) => {
+      if (data.authMethod === 'connection-string') {
+        return (
+          data.connectionString !== undefined &&
+          data.connectionString.length > 0
+        );
+      }
+      return true;
+    },
+    {
+      message:
+        'azure-blob.connectionString is required when authMethod is "connection-string"',
+      path: ['connectionString'],
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.authMethod === 'azure-identity') {
+        return data.accountName !== undefined && data.accountName.length > 0;
+      }
+      return true;
+    },
+    {
+      message:
+        'azure-blob.accountName is required when authMethod is "azure-identity"',
+      path: ['accountName'],
+    }
+  );
+
+// --- Top-level storage config schema with conditional validation ---
+
+const storageProviderEnum = z.enum(['sqlite', 'sqlserver', 'azure-blob']);
+
+export const storageConfigSchema = z
+  .object({
+    storage: z.object({
+      provider: storageProviderEnum,
+      sqlite: sqliteConfigSchema.optional(),
+      sqlserver: sqlServerConfigSchema.optional(),
+      'azure-blob': azureBlobConfigSchema.optional(),
+    }),
+  })
+  .refine(
+    (data) => {
+      const p = data.storage.provider;
+      if (p === 'sqlite') return data.storage.sqlite !== undefined;
+      if (p === 'sqlserver') return data.storage.sqlserver !== undefined;
+      if (p === 'azure-blob') return data.storage['azure-blob'] !== undefined;
+      return false;
+    },
+    {
+      message:
+        'The configuration section for the active storage provider is missing. ' +
+        'Ensure the YAML contains the section matching the selected provider.',
+    }
+  );
+
+export type StorageConfigYaml = z.infer<typeof storageConfigSchema>;
+```
+
+**Conditional validation logic**: Only the section matching the active `provider` value is required to be present and valid. Sections for inactive providers may be absent entirely. When a provider section is present but the provider is not active, it is parsed but not enforced (allows keeping templates in the file).
+
+**Azure Blob dual auth**: The `authMethod` field controls which credential fields are required:
+- `"connection-string"`: requires `connectionString`
+- `"azure-identity"`: requires `accountName` (uses `DefaultAzureCredential` from `@azure/identity`)
+
+#### E1.2 LLM Configuration Schema (`llm-config.yaml`)
+
+**Environment variable**: `LLM_CONFIG_PATH` (absolute path, required, no fallback)
+
+**YAML structure**:
+
+```yaml
+llm:
+  provider: "openai" | "anthropic" | "google"
+  temperature: 0.0
+  model: "gpt-4"
+  openai:
+    apiKey: "sk-..."
+    organization: "org-..."    # OPTIONAL - exception to no-fallback rule
+    baseUrl: "https://..."     # OPTIONAL - exception to no-fallback rule
+  anthropic:
+    apiKey: "sk-ant-..."
+    baseUrl: "https://..."     # OPTIONAL - exception to no-fallback rule
+  google:
+    apiKey: "AIza..."
+```
+
+**Complete Zod schema**:
+
+```typescript
+import { z } from 'zod';
+
+// --- Sub-schemas for each LLM provider ---
+
+const openaiProviderConfigSchema = z.object({
+  apiKey: z.string().min(1, 'openai.apiKey is required'),
+  organization: z.string().min(1).optional(), // OPTIONAL: exception to no-fallback rule
+  baseUrl: z.string().url().optional(),        // OPTIONAL: exception to no-fallback rule
+});
+
+const anthropicProviderConfigSchema = z.object({
+  apiKey: z.string().min(1, 'anthropic.apiKey is required'),
+  baseUrl: z.string().url().optional(), // OPTIONAL: exception to no-fallback rule
+});
+
+const googleProviderConfigSchema = z.object({
+  apiKey: z.string().min(1, 'google.apiKey is required'),
+});
+
+// --- Top-level LLM config schema with conditional validation ---
+
+const llmProviderEnum = z.enum(['openai', 'anthropic', 'google']);
+
+export const llmConfigSchema = z
+  .object({
+    llm: z.object({
+      provider: llmProviderEnum,
+      temperature: z
+        .number({ required_error: 'llm.temperature is required' })
+        .min(0.0, 'temperature must be >= 0.0')
+        .max(2.0, 'temperature must be <= 2.0'),
+      model: z.string().min(1, 'llm.model is required'),
+      openai: openaiProviderConfigSchema.optional(),
+      anthropic: anthropicProviderConfigSchema.optional(),
+      google: googleProviderConfigSchema.optional(),
+    }),
+  })
+  .refine(
+    (data) => {
+      const p = data.llm.provider;
+      if (p === 'openai') return data.llm.openai !== undefined;
+      if (p === 'anthropic') return data.llm.anthropic !== undefined;
+      if (p === 'google') return data.llm.google !== undefined;
+      return false;
+    },
+    {
+      message:
+        'The configuration section for the active LLM provider is missing. ' +
+        'Ensure the YAML contains the section matching the selected provider.',
+    }
+  );
+
+export type LlmConfigYaml = z.infer<typeof llmConfigSchema>;
+```
+
+**Optional fields exception**: The fields `organization`, `baseUrl` (OpenAI), and `baseUrl` (Anthropic) are explicitly optional. This is an approved exception to the project-wide no-fallback rule. When absent, they are simply not passed to the LangChain constructor. This exception is documented in the project memory.
+
+#### E1.3 YAML Loader Utility
+
+```typescript
+// src/config/yaml-loader.ts
+import * as fs from 'node:fs';
+import * as yaml from 'js-yaml';
+
+/**
+ * Reads a YAML file from disk and returns the parsed content as unknown.
+ * Throws if the file does not exist or contains invalid YAML.
+ *
+ * @param filePath - Absolute path to the YAML file
+ * @returns Parsed YAML content (unknown type, to be validated by Zod)
+ */
+export function loadYamlFile(filePath: string): unknown {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(
+      `YAML configuration file not found: ${filePath}. ` +
+        `Verify the path specified in the corresponding environment variable.`
+    );
+  }
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const parsed = yaml.load(content);
+  if (parsed === null || parsed === undefined) {
+    throw new Error(
+      `YAML configuration file is empty or invalid: ${filePath}`
+    );
+  }
+  return parsed;
+}
+```
+
+---
+
+### E2. Repository Interfaces
+
+All repository interfaces use `Promise<T>` return types to support async storage backends (SQL Server, Azure Blob). The SQLite backend wraps its synchronous better-sqlite3 calls in `async` functions for interface consistency. This is the central abstraction that enables backend-agnostic consumer code.
+
+#### E2.1 IMemoryRepository
+
+```typescript
+// src/database/interfaces.ts
+
+import type {
+  MemoryRow,
+  NewMemory,
+  ConnectionEntry,
+  MemoryStats,
+  ConsolidationRow,
+  NewConsolidation,
+  ProcessedFileRow,
+} from './types.js';
+
+/**
+ * Async interface for Memory table operations.
+ * All storage backends (SQLite, SQL Server, Azure Blob) implement this interface.
+ */
+export interface IMemoryRepository {
+  /**
+   * Inserts a new memory. Generates id, createdAt, and defaults automatically.
+   * userId defaults to 'default' if not provided in the input.
+   */
+  insert(memory: NewMemory): Promise<MemoryRow>;
+
+  /**
+   * Returns all memory rows ordered by id ascending.
+   */
+  getAll(): Promise<MemoryRow[]>;
+
+  /**
+   * Returns a single memory row by id, or undefined if not found.
+   */
+  getById(id: number): Promise<MemoryRow | undefined>;
+
+  /**
+   * Returns all memory rows where consolidated = 0, ordered by id ascending.
+   */
+  getUnconsolidated(): Promise<MemoryRow[]>;
+
+  /**
+   * Marks the specified memory ids as consolidated (consolidated = 1).
+   * Must be atomic: either all ids are marked or none.
+   */
+  markConsolidated(ids: number[]): Promise<void>;
+
+  /**
+   * Replaces the connections JSON field for a specific memory.
+   */
+  updateConnections(id: number, connections: ConnectionEntry[]): Promise<void>;
+
+  /**
+   * Deletes a memory row by id. Returns true if a row was deleted.
+   */
+  deleteById(id: number): Promise<boolean>;
+
+  /**
+   * Deletes all memory rows. Returns the count of rows deleted.
+   */
+  deleteAll(): Promise<number>;
+
+  /**
+   * Returns aggregate statistics: total, consolidated, unconsolidated, consolidations count.
+   */
+  getStats(): Promise<MemoryStats>;
+}
+```
+
+#### E2.2 IConsolidationRepository
+
+```typescript
+/**
+ * Async interface for Consolidation table operations.
+ */
+export interface IConsolidationRepository {
+  /**
+   * Inserts a new consolidation. Generates id and createdAt automatically.
+   */
+  insert(consolidation: NewConsolidation): Promise<ConsolidationRow>;
+
+  /**
+   * Returns all consolidation rows ordered by id ascending.
+   */
+  getAll(): Promise<ConsolidationRow[]>;
+
+  /**
+   * Deletes all consolidation rows. Returns the count of rows deleted.
+   */
+  deleteAll(): Promise<number>;
+
+  /**
+   * Returns the total number of consolidation rows.
+   */
+  getCount(): Promise<number>;
+}
+```
+
+#### E2.3 IProcessedFileRepository
+
+```typescript
+/**
+ * Async interface for ProcessedFile table operations.
+ */
+export interface IProcessedFileRepository {
+  /**
+   * Returns true if the file at the given path has already been processed.
+   */
+  isProcessed(filePath: string): Promise<boolean>;
+
+  /**
+   * Records the file as processed with a current timestamp.
+   * Idempotent: calling again for the same path is a no-op.
+   */
+  markProcessed(filePath: string): Promise<void>;
+
+  /**
+   * Returns all processed file rows ordered by id ascending.
+   */
+  getAll(): Promise<ProcessedFileRow[]>;
+}
+```
+
+#### E2.4 StorageBundle
+
+```typescript
+/**
+ * Groups all three repository instances and a close() handle
+ * into a single object returned by the StorageFactory.
+ *
+ * Consumers receive this bundle and destructure the repos they need.
+ * The close() method must be called during graceful shutdown.
+ */
+export interface StorageBundle {
+  readonly memoryRepo: IMemoryRepository;
+  readonly consolidationRepo: IConsolidationRepository;
+  readonly processedFileRepo: IProcessedFileRepository;
+
+  /**
+   * Releases all resources held by the storage backend.
+   * - SQLite: closes the database file handle
+   * - SQL Server: drains and closes the connection pool
+   * - Azure Blob: no-op (HTTP-based, no persistent connection)
+   */
+  close(): Promise<void>;
+}
+```
+
+---
+
+### E3. Restructured AppConfig
+
+The monolithic `AppConfig` interface is replaced with a structured hierarchy. Storage and LLM configuration come from YAML files; operational settings remain as environment variables.
+
+#### E3.1 Complete Type Definitions
+
+```typescript
+// src/config/types.ts (replacement)
+
+// =====================================================================
+// Storage Provider Types
+// =====================================================================
+
+export type StorageProvider = 'sqlite' | 'sqlserver' | 'azure-blob';
+
+export type AzureBlobAuthMethod = 'connection-string' | 'azure-identity';
+
+export type TimePeriodFormat = 'monthly' | 'weekly' | 'daily';
+
+export interface SqliteConfig {
+  readonly databasePath: string;
+}
+
+export interface SqlServerConfig {
+  readonly server: string;
+  readonly port: number;
+  readonly database: string;
+  readonly user: string;
+  readonly password: string;
+  readonly encrypt: boolean;
+  readonly trustServerCertificate: boolean;
+}
+
+export interface AzureBlobConfig {
+  readonly authMethod: AzureBlobAuthMethod;
+  /** Required when authMethod = 'connection-string' */
+  readonly connectionString?: string;
+  /** Required when authMethod = 'azure-identity' */
+  readonly accountName?: string;
+  readonly containerName: string;
+  readonly timePeriodFormat: TimePeriodFormat;
+}
+
+/**
+ * Discriminated union for storage configuration.
+ * The `provider` field determines which sub-config is guaranteed present.
+ */
+export interface StorageConfig {
+  readonly provider: StorageProvider;
+  readonly sqlite?: SqliteConfig;
+  readonly sqlserver?: SqlServerConfig;
+  readonly 'azure-blob'?: AzureBlobConfig;
+}
+
+// =====================================================================
+// LLM Provider Types
+// =====================================================================
+
+export type LlmProvider = 'openai' | 'anthropic' | 'google';
+
+export interface OpenAiProviderConfig {
+  readonly apiKey: string;
+  /** OPTIONAL: exception to no-fallback rule */
+  readonly organization?: string;
+  /** OPTIONAL: exception to no-fallback rule. For Azure OpenAI or custom endpoints. */
+  readonly baseUrl?: string;
+}
+
+export interface AnthropicProviderConfig {
+  readonly apiKey: string;
+  /** OPTIONAL: exception to no-fallback rule. For custom endpoints. */
+  readonly baseUrl?: string;
+}
+
+export interface GoogleProviderConfig {
+  readonly apiKey: string;
+}
+
+/**
+ * LLM configuration sourced from llm-config.yaml.
+ * temperature and model are shared across all providers.
+ * The provider-specific section matching `provider` is guaranteed present.
+ */
+export interface LlmConfig {
+  readonly provider: LlmProvider;
+  readonly temperature: number;
+  readonly model: string;
+  readonly openai?: OpenAiProviderConfig;
+  readonly anthropic?: AnthropicProviderConfig;
+  readonly google?: GoogleProviderConfig;
+}
+
+// =====================================================================
+// Top-Level Application Config
+// =====================================================================
+
+/**
+ * Complete application configuration.
+ *
+ * - storage: from storage-config.yaml (via STORAGE_CONFIG_PATH env var)
+ * - llm: from llm-config.yaml (via LLM_CONFIG_PATH env var)
+ * - watchDirectory, apiPort, consolidationIntervalMs: from environment variables
+ *
+ * All fields are required. No defaults. No fallbacks.
+ * Missing any parameter causes an exception at startup.
+ */
+export interface AppConfig {
+  readonly storage: StorageConfig;
+  readonly llm: LlmConfig;
+  /** Path to inbox directory for file watching (env: WATCH_DIRECTORY) */
+  readonly watchDirectory: string;
+  /** HTTP server port number 1-65535 (env: API_PORT) */
+  readonly apiPort: number;
+  /** Consolidation loop interval in milliseconds >= 1000 (env: CONSOLIDATION_INTERVAL_MS) */
+  readonly consolidationIntervalMs: number;
+}
+```
+
+#### E3.2 Environment Variables (Final State)
+
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `STORAGE_CONFIG_PATH` | Absolute path to `storage-config.yaml` | Yes, no fallback |
+| `LLM_CONFIG_PATH` | Absolute path to `llm-config.yaml` | Yes, no fallback |
+| `WATCH_DIRECTORY` | Path to the inbox directory for file watcher | Yes, no fallback |
+| `API_PORT` | HTTP server port number | Yes, no fallback |
+| `CONSOLIDATION_INTERVAL_MS` | Timer interval for consolidation loop (ms) | Yes, no fallback |
+
+**Removed**: `LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY`, `DATABASE_PATH`
+
+#### E3.3 Updated loadConfig()
+
+```typescript
+// src/config/config.ts (updated)
+import { loadYamlFile } from './yaml-loader.js';
+import { storageConfigSchema } from './storage-config-schema.js';
+import { llmConfigSchema } from './llm-config-schema.js';
+import type { AppConfig } from './types.js';
+
+export function loadConfig(): AppConfig {
+  // 1. Read mandatory env var paths
+  const storageConfigPath = process.env.STORAGE_CONFIG_PATH;
+  if (!storageConfigPath) {
+    throw new Error(
+      'Environment variable STORAGE_CONFIG_PATH is not set. ' +
+        'It must contain the absolute path to storage-config.yaml.'
+    );
+  }
+
+  const llmConfigPath = process.env.LLM_CONFIG_PATH;
+  if (!llmConfigPath) {
+    throw new Error(
+      'Environment variable LLM_CONFIG_PATH is not set. ' +
+        'It must contain the absolute path to llm-config.yaml.'
+    );
+  }
+
+  // 2. Load and validate YAML files
+  const rawStorage = loadYamlFile(storageConfigPath);
+  const storageResult = storageConfigSchema.safeParse(rawStorage);
+  if (!storageResult.success) {
+    throw new Error(
+      `Invalid storage-config.yaml at ${storageConfigPath}:\n` +
+        storageResult.error.issues
+          .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
+          .join('\n')
+    );
+  }
+
+  const rawLlm = loadYamlFile(llmConfigPath);
+  const llmResult = llmConfigSchema.safeParse(rawLlm);
+  if (!llmResult.success) {
+    throw new Error(
+      `Invalid llm-config.yaml at ${llmConfigPath}:\n` +
+        llmResult.error.issues
+          .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
+          .join('\n')
+    );
+  }
+
+  // 3. Read remaining env vars (no fallbacks)
+  const watchDirectory = process.env.WATCH_DIRECTORY;
+  if (!watchDirectory) {
+    throw new Error('Environment variable WATCH_DIRECTORY is not set.');
+  }
+
+  const apiPortStr = process.env.API_PORT;
+  if (!apiPortStr) {
+    throw new Error('Environment variable API_PORT is not set.');
+  }
+  const apiPort = parseInt(apiPortStr, 10);
+  if (isNaN(apiPort) || apiPort < 1 || apiPort > 65535) {
+    throw new Error(
+      `API_PORT must be an integer between 1 and 65535. Got: "${apiPortStr}"`
+    );
+  }
+
+  const intervalStr = process.env.CONSOLIDATION_INTERVAL_MS;
+  if (!intervalStr) {
+    throw new Error(
+      'Environment variable CONSOLIDATION_INTERVAL_MS is not set.'
+    );
+  }
+  const consolidationIntervalMs = parseInt(intervalStr, 10);
+  if (isNaN(consolidationIntervalMs) || consolidationIntervalMs < 1000) {
+    throw new Error(
+      `CONSOLIDATION_INTERVAL_MS must be an integer >= 1000. Got: "${intervalStr}"`
+    );
+  }
+
+  // 4. Assemble and return
+  return {
+    storage: storageResult.data.storage,
+    llm: llmResult.data.llm,
+    watchDirectory,
+    apiPort,
+    consolidationIntervalMs,
+  };
+}
+```
+
+---
+
+### E4. SQLite Backend Refactor
+
+The existing synchronous better-sqlite3 repositories are moved into `src/database/sqlite/` and refactored to implement the async interfaces. No behavioral changes -- only structural reorganization and `async` wrapping.
+
+#### E4.1 File Moves
+
+| Current Location | New Location |
+|------------------|--------------|
+| `src/database/memory-repository.ts` | `src/database/sqlite/sqlite-memory-repository.ts` |
+| `src/database/consolidation-repository.ts` | `src/database/sqlite/sqlite-consolidation-repository.ts` |
+| `src/database/processed-file-repository.ts` | `src/database/sqlite/sqlite-processed-file-repository.ts` |
+| `src/database/connection.ts` | `src/database/sqlite/connection.ts` |
+| `src/database/schema.ts` | `src/database/sqlite/schema.ts` |
+
+The original files in `src/database/` are deleted after the move.
+
+#### E4.2 Async Wrapping Pattern
+
+Since better-sqlite3 is synchronous, each method is declared `async` and the synchronous return value is implicitly wrapped in a resolved `Promise`. No explicit `Promise.resolve()` is needed.
+
+```typescript
+// src/database/sqlite/sqlite-memory-repository.ts
+
+import type Database from 'better-sqlite3';
+import type { IMemoryRepository } from '../interfaces.js';
+import type {
+  MemoryRow,
+  NewMemory,
+  ConnectionEntry,
+  MemoryStats,
+} from '../types.js';
+
+export class SqliteMemoryRepository implements IMemoryRepository {
+  private readonly db: Database.Database;
+  private readonly insertStmt: Database.Statement;
+  private readonly getAllStmt: Database.Statement;
+  private readonly getByIdStmt: Database.Statement;
+  private readonly getUnconsolidatedStmt: Database.Statement;
+  private readonly updateConnectionsStmt: Database.Statement;
+  private readonly deleteByIdStmt: Database.Statement;
+  private readonly deleteAllStmt: Database.Statement;
+  private readonly totalCountStmt: Database.Statement;
+  private readonly consolidatedCountStmt: Database.Statement;
+  private readonly consolidationsCountStmt: Database.Statement;
+
+  constructor(db: Database.Database) {
+    this.db = db;
+    // Prepared statements are identical to the current implementation
+    this.insertStmt = db.prepare(`
+      INSERT INTO Memory (userId, source, rawText, summary, entities,
+                          topics, importance, consolidated, connections, createdAt)
+      VALUES (@userId, @source, @rawText, @summary, @entities,
+              @topics, @importance, 0, '[]', @createdAt)
+    `);
+    this.getAllStmt = db.prepare('SELECT * FROM Memory ORDER BY id ASC');
+    this.getByIdStmt = db.prepare('SELECT * FROM Memory WHERE id = ?');
+    this.getUnconsolidatedStmt = db.prepare(
+      'SELECT * FROM Memory WHERE consolidated = 0 ORDER BY id ASC'
+    );
+    this.updateConnectionsStmt = db.prepare(
+      'UPDATE Memory SET connections = ? WHERE id = ?'
+    );
+    this.deleteByIdStmt = db.prepare('DELETE FROM Memory WHERE id = ?');
+    this.deleteAllStmt = db.prepare('DELETE FROM Memory');
+    this.totalCountStmt = db.prepare('SELECT COUNT(*) AS count FROM Memory');
+    this.consolidatedCountStmt = db.prepare(
+      'SELECT COUNT(*) AS count FROM Memory WHERE consolidated = 1'
+    );
+    this.consolidationsCountStmt = db.prepare(
+      'SELECT COUNT(*) AS count FROM Consolidation'
+    );
+  }
+
+  async insert(memory: NewMemory): Promise<MemoryRow> {
+    const params = {
+      userId: memory.userId ?? 'default',
+      source: memory.source,
+      rawText: memory.rawText,
+      summary: memory.summary,
+      entities: memory.entities,
+      topics: memory.topics,
+      importance: memory.importance,
+      createdAt: new Date().toISOString(),
+    };
+    const result = this.insertStmt.run(params);
+    return this.getByIdStmt.get(Number(result.lastInsertRowid)) as MemoryRow;
+  }
+
+  async getAll(): Promise<MemoryRow[]> {
+    return this.getAllStmt.all() as MemoryRow[];
+  }
+
+  async getById(id: number): Promise<MemoryRow | undefined> {
+    return this.getByIdStmt.get(id) as MemoryRow | undefined;
+  }
+
+  async getUnconsolidated(): Promise<MemoryRow[]> {
+    return this.getUnconsolidatedStmt.all() as MemoryRow[];
+  }
+
+  async markConsolidated(ids: number[]): Promise<void> {
+    const markStmt = this.db.prepare(
+      'UPDATE Memory SET consolidated = 1 WHERE id = ?'
+    );
+    const transaction = this.db.transaction((memoryIds: number[]) => {
+      for (const id of memoryIds) {
+        markStmt.run(id);
+      }
+    });
+    transaction(ids);
+  }
+
+  async updateConnections(
+    id: number,
+    connections: ConnectionEntry[]
+  ): Promise<void> {
+    this.updateConnectionsStmt.run(JSON.stringify(connections), id);
+  }
+
+  async deleteById(id: number): Promise<boolean> {
+    const result = this.deleteByIdStmt.run(id);
+    return result.changes > 0;
+  }
+
+  async deleteAll(): Promise<number> {
+    const result = this.deleteAllStmt.run();
+    return result.changes;
+  }
+
+  async getStats(): Promise<MemoryStats> {
+    const total = (this.totalCountStmt.get() as { count: number }).count;
+    const consolidated = (
+      this.consolidatedCountStmt.get() as { count: number }
+    ).count;
+    const consolidations = (
+      this.consolidationsCountStmt.get() as { count: number }
+    ).count;
+    return {
+      total,
+      consolidated,
+      unconsolidated: total - consolidated,
+      consolidations,
+    };
+  }
+}
+```
+
+The `SqliteConsolidationRepository` and `SqliteProcessedFileRepository` follow the same pattern: identical logic to the current classes, declared `async`, implementing `IConsolidationRepository` and `IProcessedFileRepository` respectively.
+
+#### E4.3 SQLite Connection Module
+
+```typescript
+// src/database/sqlite/connection.ts
+import Database from 'better-sqlite3';
+import { ALL_SCHEMA_STATEMENTS } from './schema.js';
+
+export function initializeSqliteDatabase(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  for (const statement of ALL_SCHEMA_STATEMENTS) {
+    db.exec(statement);
+  }
+  return db;
+}
+
+export function closeSqliteDatabase(db: Database.Database): void {
+  db.close();
+}
+```
+
+The schema file (`src/database/sqlite/schema.ts`) is moved as-is from `src/database/schema.ts` with no changes.
+
+---
+
+### E5. SQL Server Backend
+
+#### E5.1 Schema DDL
+
+```sql
+-- src/database/sqlserver/schema.ts (exported as string constants)
+
+-- Memory table
+IF OBJECT_ID('dbo.Memory', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Memory (
+    id                  INT IDENTITY(1,1) PRIMARY KEY,
+    userId              NVARCHAR(255)   NOT NULL DEFAULT 'default',
+    source              NVARCHAR(MAX)   NOT NULL,
+    rawText             NVARCHAR(MAX)   NOT NULL,
+    summary             NVARCHAR(MAX)   NOT NULL,
+    entities            NVARCHAR(MAX)   NOT NULL DEFAULT '[]',
+    topics              NVARCHAR(MAX)   NOT NULL DEFAULT '[]',
+    importance          FLOAT           NOT NULL DEFAULT 0.0,
+    consolidated        BIT             NOT NULL DEFAULT 0,
+    connections         NVARCHAR(MAX)   NOT NULL DEFAULT '[]',
+    createdAt           NVARCHAR(50)    NOT NULL,
+    CONSTRAINT CK_Memory_importance CHECK (importance >= 0.0 AND importance <= 1.0)
+  );
+
+  CREATE INDEX idx_memory_userId ON dbo.Memory(userId);
+  CREATE INDEX idx_memory_consolidated ON dbo.Memory(consolidated);
+  CREATE INDEX idx_memory_importance ON dbo.Memory(importance);
+END
+
+-- Consolidation table
+IF OBJECT_ID('dbo.Consolidation', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.Consolidation (
+    id                  INT IDENTITY(1,1) PRIMARY KEY,
+    userId              NVARCHAR(255)   NOT NULL,
+    sourceIds           NVARCHAR(MAX)   NOT NULL DEFAULT '[]',
+    summary             NVARCHAR(MAX)   NOT NULL,
+    insight             NVARCHAR(MAX)   NOT NULL,
+    createdAt           NVARCHAR(50)    NOT NULL
+  );
+
+  CREATE INDEX idx_consolidation_userId ON dbo.Consolidation(userId);
+END
+
+-- ProcessedFile table
+IF OBJECT_ID('dbo.ProcessedFile', 'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.ProcessedFile (
+    id                  INT IDENTITY(1,1) PRIMARY KEY,
+    filePath            NVARCHAR(1000)  NOT NULL,
+    processedAt         NVARCHAR(50)    NOT NULL,
+    CONSTRAINT UQ_ProcessedFile_filePath UNIQUE (filePath)
+  );
+END
+```
+
+**Key differences from SQLite**:
+- `INTEGER` becomes `INT IDENTITY(1,1)` for auto-increment
+- `TEXT` becomes `NVARCHAR(MAX)` for Unicode support
+- `REAL` becomes `FLOAT`
+- `INTEGER` (boolean) becomes `BIT`
+- `CREATE TABLE IF NOT EXISTS` becomes `IF OBJECT_ID(...) IS NULL BEGIN ... END`
+- `INSERT OR IGNORE` becomes `MERGE` or `IF NOT EXISTS` pattern
+
+#### E5.2 Connection Pool Setup
+
+```typescript
+// src/database/sqlserver/connection.ts
+import * as sql from 'mssql';
+import type { SqlServerConfig } from '../../config/types.js';
+import {
+  CREATE_MEMORY_TABLE_DDL,
+  CREATE_CONSOLIDATION_TABLE_DDL,
+  CREATE_PROCESSED_FILE_TABLE_DDL,
+} from './schema.js';
+
+export async function initializeSqlServerDatabase(
+  config: SqlServerConfig
+): Promise<sql.ConnectionPool> {
+  const poolConfig: sql.config = {
+    server: config.server,
+    port: config.port,
+    database: config.database,
+    user: config.user,
+    password: config.password,
+    options: {
+      encrypt: config.encrypt,
+      trustServerCertificate: config.trustServerCertificate,
+    },
+    pool: {
+      min: 2,
+      max: 10,
+      idleTimeoutMillis: 30000,
+    },
+  };
+
+  const pool = new sql.ConnectionPool(poolConfig);
+  await pool.connect();
+
+  // Run schema initialization
+  const request = pool.request();
+  await request.batch(CREATE_MEMORY_TABLE_DDL);
+  await request.batch(CREATE_CONSOLIDATION_TABLE_DDL);
+  await request.batch(CREATE_PROCESSED_FILE_TABLE_DDL);
+
+  return pool;
+}
+
+export async function closeSqlServerDatabase(
+  pool: sql.ConnectionPool
+): Promise<void> {
+  await pool.close();
+}
+```
+
+#### E5.3 Repository Implementation Pattern
+
+All SQL Server repositories use parameterized queries via `.input()` for SQL injection prevention. Example for `SqlServerMemoryRepository.insert()`:
+
+```typescript
+// src/database/sqlserver/sqlserver-memory-repository.ts
+import * as sql from 'mssql';
+import type { IMemoryRepository } from '../interfaces.js';
+import type { MemoryRow, NewMemory, ConnectionEntry, MemoryStats } from '../types.js';
+
+export class SqlServerMemoryRepository implements IMemoryRepository {
+  constructor(private readonly pool: sql.ConnectionPool) {}
+
+  async insert(memory: NewMemory): Promise<MemoryRow> {
+    const createdAt = new Date().toISOString();
+    const userId = memory.userId ?? 'default';
+
+    const result = await this.pool
+      .request()
+      .input('userId', sql.NVarChar, userId)
+      .input('source', sql.NVarChar, memory.source)
+      .input('rawText', sql.NVarChar, memory.rawText)
+      .input('summary', sql.NVarChar, memory.summary)
+      .input('entities', sql.NVarChar, memory.entities)
+      .input('topics', sql.NVarChar, memory.topics)
+      .input('importance', sql.Float, memory.importance)
+      .input('createdAt', sql.NVarChar, createdAt)
+      .query(`
+        INSERT INTO Memory (userId, source, rawText, summary, entities,
+                            topics, importance, consolidated, connections, createdAt)
+        OUTPUT INSERTED.*
+        VALUES (@userId, @source, @rawText, @summary, @entities,
+                @topics, @importance, 0, '[]', @createdAt)
+      `);
+
+    return this.mapRow(result.recordset[0]);
+  }
+
+  async markConsolidated(ids: number[]): Promise<void> {
+    const transaction = new sql.Transaction(this.pool);
+    await transaction.begin();
+    try {
+      for (const id of ids) {
+        await transaction
+          .request()
+          .input('id', sql.Int, id)
+          .query('UPDATE Memory SET consolidated = 1 WHERE id = @id');
+      }
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  }
+
+  async getStats(): Promise<MemoryStats> {
+    const result = await this.pool.request().query(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN consolidated = 1 THEN 1 ELSE 0 END) AS consolidated,
+        (SELECT COUNT(*) FROM Consolidation) AS consolidations
+      FROM Memory
+    `);
+    const row = result.recordset[0];
+    return {
+      total: row.total,
+      consolidated: row.consolidated,
+      unconsolidated: row.total - row.consolidated,
+      consolidations: row.consolidations,
+    };
+  }
+
+  // ... remaining methods follow the same parameterized query pattern
+
+  /**
+   * Maps a SQL Server recordset row to MemoryRow.
+   * Handles BIT -> number conversion for the consolidated field.
+   */
+  private mapRow(row: Record<string, unknown>): MemoryRow {
+    return {
+      id: row.id as number,
+      userId: row.userId as string,
+      source: row.source as string,
+      rawText: row.rawText as string,
+      summary: row.summary as string,
+      entities: row.entities as string,
+      topics: row.topics as string,
+      importance: row.importance as number,
+      consolidated: (row.consolidated as boolean) ? 1 : 0,
+      connections: row.connections as string,
+      createdAt: row.createdAt as string,
+    };
+  }
+}
+```
+
+**Key patterns**:
+- `OUTPUT INSERTED.*` replaces the SQLite pattern of running a separate SELECT after INSERT
+- `sql.Transaction` wraps `markConsolidated()` for atomicity
+- `mapRow()` normalizes SQL Server `BIT` (boolean) to the `number` (0/1) that `MemoryRow` expects
+- `SqlServerConsolidationRepository` and `SqlServerProcessedFileRepository` follow the same parameterized query pattern
+
+---
+
+### E6. Azure Blob Storage Backend
+
+#### E6.1 Blob Naming Convention
+
+```
+{userId}/{timePeriod}/memories.json          -- Array<MemoryRow>
+{userId}/{timePeriod}/consolidations.json    -- Array<ConsolidationRow>
+{userId}/processed-files.json                -- Array<ProcessedFileRow>
+```
+
+**Time period formats** (based on `timePeriodFormat` config):
+
+| Format | Pattern | Example |
+|--------|---------|---------|
+| `monthly` | `YYYY-MM` | `2026-03` |
+| `weekly` | `YYYY-Www` | `2026-W10` |
+| `daily` | `YYYY-MM-DD` | `2026-03-09` |
+
+**ProcessedFile exception**: Not time-bucketed because file processing tracking is not time-scoped. Stored as a single blob per user.
+
+**Example blob paths** for user "john" in March 2026 (monthly):
+```
+john/2026-03/memories.json
+john/2026-03/consolidations.json
+john/processed-files.json
+```
+
+#### E6.2 JSON Blob Structure
+
+Each blob contains a JSON array of the corresponding row type:
+
+```json
+// john/2026-03/memories.json
+[
+  {
+    "id": 1,
+    "userId": "john",
+    "source": "api",
+    "rawText": "...",
+    "summary": "...",
+    "entities": "[\"entity1\"]",
+    "topics": "[\"topic1\"]",
+    "importance": 0.8,
+    "consolidated": 0,
+    "connections": "[]",
+    "createdAt": "2026-03-09T10:30:00.000Z"
+  }
+]
+```
+
+JSON fields (`entities`, `topics`, `connections`, `sourceIds`) remain as serialized JSON strings within the blob JSON, matching the SQLite/SQL Server column representation. This ensures `MemoryRow` and `ConsolidationRow` types are used consistently across all backends.
+
+#### E6.3 Connection Initialization
+
+```typescript
+// src/database/azure-blob/connection.ts
+import {
+  BlobServiceClient,
+  ContainerClient,
+} from '@azure/storage-blob';
+import { DefaultAzureCredential } from '@azure/identity';
+import type { AzureBlobConfig } from '../../config/types.js';
+
+export async function initializeAzureBlobStorage(
+  config: AzureBlobConfig
+): Promise<ContainerClient> {
+  let blobServiceClient: BlobServiceClient;
+
+  switch (config.authMethod) {
+    case 'connection-string': {
+      blobServiceClient = BlobServiceClient.fromConnectionString(
+        config.connectionString!
+      );
+      break;
+    }
+    case 'azure-identity': {
+      const credential = new DefaultAzureCredential();
+      const accountUrl = `https://${config.accountName!}.blob.core.windows.net`;
+      blobServiceClient = new BlobServiceClient(accountUrl, credential);
+      break;
+    }
+    default: {
+      const _exhaustive: never = config.authMethod;
+      throw new Error(`Unsupported auth method: ${config.authMethod}`);
+    }
+  }
+
+  const containerClient = blobServiceClient.getContainerClient(
+    config.containerName
+  );
+  await containerClient.createIfNotExists();
+  return containerClient;
+}
+```
+
+#### E6.4 Read-Modify-Write with ETags
+
+```typescript
+// src/database/azure-blob/blob-helpers.ts
+import type {
+  BlockBlobClient,
+  ContainerClient,
+  BlobDownloadResponseParsed,
+} from '@azure/storage-blob';
+
+const MAX_RETRIES = 3;
+
+interface BlobReadResult<T> {
+  items: T[];
+  etag: string | undefined;
+}
+
+/**
+ * Reads a JSON blob. Returns empty array if the blob does not exist.
+ */
+export async function readJsonBlob<T>(
+  blockBlobClient: BlockBlobClient
+): Promise<BlobReadResult<T>> {
+  try {
+    const response: BlobDownloadResponseParsed =
+      await blockBlobClient.download(0);
+    const body = await streamToString(response.readableStreamBody!);
+    const items = JSON.parse(body) as T[];
+    return { items, etag: response.etag };
+  } catch (error: unknown) {
+    if (isBlobNotFoundError(error)) {
+      return { items: [], etag: undefined };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Writes a JSON blob with optional ETag condition for optimistic concurrency.
+ */
+export async function writeJsonBlob<T>(
+  blockBlobClient: BlockBlobClient,
+  items: T[],
+  etag?: string
+): Promise<void> {
+  const content = JSON.stringify(items, null, 2);
+  const conditions = etag ? { ifMatch: etag } : {};
+  await blockBlobClient.upload(content, Buffer.byteLength(content), {
+    blobHTTPHeaders: { blobContentType: 'application/json' },
+    conditions,
+  });
+}
+
+/**
+ * Atomic read-modify-write with ETag-based optimistic concurrency.
+ * Retries up to MAX_RETRIES times on ETag mismatch (HTTP 412).
+ */
+export async function readModifyWrite<T>(
+  blockBlobClient: BlockBlobClient,
+  modifier: (items: T[]) => T[]
+): Promise<T[]> {
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const { items, etag } = await readJsonBlob<T>(blockBlobClient);
+    const modified = modifier(items);
+    try {
+      await writeJsonBlob(blockBlobClient, modified, etag);
+      return modified;
+    } catch (error: unknown) {
+      if (isEtagMismatchError(error) && attempt < MAX_RETRIES - 1) {
+        continue; // Retry with fresh read
+      }
+      throw error;
+    }
+  }
+  throw new Error(
+    `readModifyWrite failed after ${MAX_RETRIES} retries due to concurrent modifications`
+  );
+}
+
+/**
+ * Generates the time-period key for the current date.
+ */
+export function generateTimePeriodKey(
+  format: 'monthly' | 'weekly' | 'daily'
+): string {
+  const now = new Date();
+  switch (format) {
+    case 'monthly':
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    case 'weekly': {
+      const weekNumber = getISOWeekNumber(now);
+      return `${now.getFullYear()}-W${String(weekNumber).padStart(2, '0')}`;
+    }
+    case 'daily':
+      return now.toISOString().slice(0, 10);
+    default: {
+      const _exhaustive: never = format;
+      throw new Error(`Unsupported time period format: ${format}`);
+    }
+  }
+}
+
+/**
+ * Lists all time-period prefixes for a given user by listing blobs.
+ * Used for cross-period scanning (getAll, getUnconsolidated).
+ */
+export async function listTimePeriodPrefixes(
+  containerClient: ContainerClient,
+  userId: string,
+  dataType: string
+): Promise<string[]> {
+  const prefixes: string[] = [];
+  const prefix = `${userId}/`;
+  for await (const blob of containerClient.listBlobsFlat({ prefix })) {
+    if (blob.name.endsWith(`/${dataType}.json`)) {
+      prefixes.push(blob.name);
+    }
+  }
+  return prefixes;
+}
+
+function isBlobNotFoundError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'statusCode' in error &&
+    (error as { statusCode: number }).statusCode === 404
+  );
+}
+
+function isEtagMismatchError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'statusCode' in error &&
+    (error as { statusCode: number }).statusCode === 412
+  );
+}
+
+function getISOWeekNumber(date: Date): number {
+  const d = new Date(
+    Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
+  );
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+}
+
+async function streamToString(
+  stream: NodeJS.ReadableStream
+): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf-8');
+}
+```
+
+#### E6.5 Cross-Period Scanning
+
+Operations that need all data across time periods (`getAll()`, `getUnconsolidated()`, `getStats()`, `deleteAll()`) must scan multiple blobs.
+
+**Strategy**: List all blobs matching `{userId}/*/memories.json`, read each, merge results.
+
+```typescript
+// In AzureBlobMemoryRepository:
+
+async getAll(): Promise<MemoryRow[]> {
+  const blobPaths = await listTimePeriodPrefixes(
+    this.containerClient,
+    this.userId,
+    'memories'
+  );
+  const allMemories: MemoryRow[] = [];
+  for (const blobPath of blobPaths) {
+    const client = this.containerClient.getBlockBlobClient(blobPath);
+    const { items } = await readJsonBlob<MemoryRow>(client);
+    allMemories.push(...items);
+  }
+  return allMemories.sort((a, b) => a.id - b.id);
+}
+
+async getUnconsolidated(): Promise<MemoryRow[]> {
+  const all = await this.getAll();
+  return all.filter((m) => m.consolidated === 0);
+}
+
+async markConsolidated(ids: number[]): Promise<void> {
+  const idSet = new Set(ids);
+  const blobPaths = await listTimePeriodPrefixes(
+    this.containerClient,
+    this.userId,
+    'memories'
+  );
+  for (const blobPath of blobPaths) {
+    const client = this.containerClient.getBlockBlobClient(blobPath);
+    await readModifyWrite<MemoryRow>(client, (memories) =>
+      memories.map((m) =>
+        idSet.has(m.id) ? { ...m, consolidated: 1 } : m
+      )
+    );
+  }
+}
+```
+
+**Performance note**: Cross-period scanning reads all period blobs sequentially. For the initial implementation this is acceptable. An index blob optimization (maintaining a global index of memory IDs to their period blobs) is deferred to a future enhancement.
+
+#### E6.6 Auto-ID Generation
+
+Since Azure Blob Storage has no auto-increment facility, IDs are generated by finding the maximum existing ID across all period blobs and adding 1:
+
+```typescript
+private async getNextId(): Promise<number> {
+  const allMemories = await this.getAll();
+  if (allMemories.length === 0) return 1;
+  return Math.max(...allMemories.map((m) => m.id)) + 1;
+}
+```
+
+This approach is safe for single-agent deployment. Under concurrent access, the ETag-based read-modify-write pattern prevents duplicate IDs.
+
+---
+
+### E7. Storage Factory
+
+The `StorageFactory` reads the `storage` section of the validated config and instantiates the correct backend, returning a `StorageBundle`.
+
+```typescript
+// src/database/storage-factory.ts
+import type { StorageConfig } from '../config/types.js';
+import type { StorageBundle } from './interfaces.js';
+
+// SQLite imports
+import { initializeSqliteDatabase, closeSqliteDatabase } from './sqlite/connection.js';
+import { SqliteMemoryRepository } from './sqlite/sqlite-memory-repository.js';
+import { SqliteConsolidationRepository } from './sqlite/sqlite-consolidation-repository.js';
+import { SqliteProcessedFileRepository } from './sqlite/sqlite-processed-file-repository.js';
+
+// SQL Server imports
+import {
+  initializeSqlServerDatabase,
+  closeSqlServerDatabase,
+} from './sqlserver/connection.js';
+import { SqlServerMemoryRepository } from './sqlserver/sqlserver-memory-repository.js';
+import { SqlServerConsolidationRepository } from './sqlserver/sqlserver-consolidation-repository.js';
+import { SqlServerProcessedFileRepository } from './sqlserver/sqlserver-processed-file-repository.js';
+
+// Azure Blob imports
+import { initializeAzureBlobStorage } from './azure-blob/connection.js';
+import { AzureBlobMemoryRepository } from './azure-blob/azure-blob-memory-repository.js';
+import { AzureBlobConsolidationRepository } from './azure-blob/azure-blob-consolidation-repository.js';
+import { AzureBlobProcessedFileRepository } from './azure-blob/azure-blob-processed-file-repository.js';
+
+export class StorageFactory {
+  /**
+   * Creates the storage bundle for the configured provider.
+   * Initializes connections/containers and returns all three repos + close handle.
+   *
+   * @throws Error if the provider is unsupported or connection fails.
+   */
+  static async create(config: StorageConfig): Promise<StorageBundle> {
+    switch (config.provider) {
+      case 'sqlite': {
+        const sqliteConfig = config.sqlite!; // Guaranteed by Zod validation
+        const db = initializeSqliteDatabase(sqliteConfig.databasePath);
+        return {
+          memoryRepo: new SqliteMemoryRepository(db),
+          consolidationRepo: new SqliteConsolidationRepository(db),
+          processedFileRepo: new SqliteProcessedFileRepository(db),
+          close: async () => closeSqliteDatabase(db),
+        };
+      }
+
+      case 'sqlserver': {
+        const sqlServerConfig = config.sqlserver!; // Guaranteed by Zod validation
+        const pool = await initializeSqlServerDatabase(sqlServerConfig);
+        return {
+          memoryRepo: new SqlServerMemoryRepository(pool),
+          consolidationRepo: new SqlServerConsolidationRepository(pool),
+          processedFileRepo: new SqlServerProcessedFileRepository(pool),
+          close: async () => await closeSqlServerDatabase(pool),
+        };
+      }
+
+      case 'azure-blob': {
+        const blobConfig = config['azure-blob']!; // Guaranteed by Zod validation
+        const containerClient = await initializeAzureBlobStorage(blobConfig);
+        return {
+          memoryRepo: new AzureBlobMemoryRepository(
+            containerClient,
+            blobConfig
+          ),
+          consolidationRepo: new AzureBlobConsolidationRepository(
+            containerClient,
+            blobConfig
+          ),
+          processedFileRepo: new AzureBlobProcessedFileRepository(
+            containerClient
+          ),
+          close: async () => {
+            /* No-op: Azure Blob is HTTP-based, no persistent connection */
+          },
+        };
+      }
+
+      default: {
+        const _exhaustive: never = config.provider;
+        throw new Error(
+          `Unsupported storage provider: "${config.provider}". ` +
+            `Supported providers: sqlite, sqlserver, azure-blob`
+        );
+      }
+    }
+  }
+}
+```
+
+**Usage in `src/index.ts`**:
+
+```typescript
+const config = loadConfig();
+const storage = await StorageFactory.create(config.storage);
+const { memoryRepo, consolidationRepo, processedFileRepo } = storage;
+
+// ... wire repos into agents, routes, watcher ...
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  await storage.close();
+  process.exit(0);
+});
+```
+
+---
+
+### E8. Updated LLM Factory
+
+The `createLlm()` function is updated to accept `LlmConfig` instead of the flat `AppConfig`. Temperature is read from config (no longer hardcoded to 0). Optional fields (`organization`, `baseUrl`) are conditionally passed.
+
+```typescript
+// src/llm/provider-factory.ts (updated)
+import { ChatOpenAI } from '@langchain/openai';
+import { ChatAnthropic } from '@langchain/anthropic';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import type { LlmConfig } from '../config/types.js';
+
+/**
+ * Creates a LangChain chat model instance from the YAML-sourced LLM configuration.
+ *
+ * @param llmConfig - LLM configuration from llm-config.yaml (validated by Zod)
+ * @returns A configured BaseChatModel instance
+ * @throws Error if the provider is not recognized
+ */
+export function createLlm(llmConfig: LlmConfig): BaseChatModel {
+  switch (llmConfig.provider) {
+    case 'openai': {
+      const openaiConfig = llmConfig.openai!; // Guaranteed by Zod conditional validation
+      return new ChatOpenAI({
+        openAIApiKey: openaiConfig.apiKey,
+        modelName: llmConfig.model,
+        temperature: llmConfig.temperature,
+        ...(openaiConfig.organization && {
+          configuration: {
+            organization: openaiConfig.organization,
+          },
+        }),
+        ...(openaiConfig.baseUrl && {
+          configuration: {
+            ...(openaiConfig.organization && {
+              organization: openaiConfig.organization,
+            }),
+            baseURL: openaiConfig.baseUrl,
+          },
+        }),
+      });
+    }
+
+    case 'anthropic': {
+      const anthropicConfig = llmConfig.anthropic!; // Guaranteed by Zod conditional validation
+      return new ChatAnthropic({
+        anthropicApiKey: anthropicConfig.apiKey,
+        modelName: llmConfig.model,
+        temperature: llmConfig.temperature,
+        ...(anthropicConfig.baseUrl && {
+          clientOptions: { baseURL: anthropicConfig.baseUrl },
+        }),
+      });
+    }
+
+    case 'google': {
+      const googleConfig = llmConfig.google!; // Guaranteed by Zod conditional validation
+      return new ChatGoogleGenerativeAI({
+        apiKey: googleConfig.apiKey,
+        model: llmConfig.model,
+        temperature: llmConfig.temperature,
+      });
+    }
+
+    default: {
+      const _exhaustive: never = llmConfig.provider;
+      throw new Error(
+        `Unsupported LLM provider: "${(llmConfig as { provider: string }).provider}". ` +
+          `Supported providers: openai, anthropic, google`
+      );
+    }
+  }
+}
+```
+
+**Changes from v1.0**:
+- Parameter: `AppConfig` replaced by `LlmConfig`
+- Temperature: `llmConfig.temperature` replaces hardcoded `0`
+- Optional `organization`: passed in `configuration` object when present
+- Optional `baseUrl` (OpenAI): passed as `configuration.baseURL` when present
+- Optional `baseUrl` (Anthropic): passed as `clientOptions.baseURL` when present
+- Call site changes: `createLlm(config)` becomes `createLlm(config.llm)`
+
+---
+
+### E9. Updated Module Organization
+
+#### E9.1 New File Tree
+
+```
+src/
+├── config/
+│   ├── config.ts                              # MODIFIED: loads YAML + env vars
+│   ├── llm-config-schema.ts                   # NEW: Zod schema for llm-config.yaml
+│   ├── storage-config-schema.ts               # NEW: Zod schema for storage-config.yaml
+│   ├── types.ts                               # MODIFIED: StorageConfig, LlmConfig, AppConfig
+│   ├── validation.ts                          # MODIFIED: validates new AppConfig structure
+│   ├── yaml-loader.ts                         # NEW: generic YAML file loader
+│   └── index.ts                               # MODIFIED: exports new types/schemas
+│
+├── database/
+│   ├── interfaces.ts                          # NEW: IMemoryRepository, IConsolidationRepository,
+│   │                                          #       IProcessedFileRepository, StorageBundle
+│   ├── types.ts                               # UNCHANGED: MemoryRow, NewMemory, etc.
+│   ├── storage-factory.ts                     # NEW: StorageFactory.create()
+│   │
+│   ├── sqlite/
+│   │   ├── connection.ts                      # MOVED from src/database/connection.ts
+│   │   ├── schema.ts                          # MOVED from src/database/schema.ts
+│   │   ├── sqlite-memory-repository.ts        # NEW: async wrapper of old MemoryRepository
+│   │   ├── sqlite-consolidation-repository.ts # NEW: async wrapper of old ConsolidationRepository
+│   │   ├── sqlite-processed-file-repository.ts# NEW: async wrapper of old ProcessedFileRepository
+│   │   └── index.ts                           # NEW: barrel export
+│   │
+│   ├── sqlserver/
+│   │   ├── connection.ts                      # NEW: pool init/close
+│   │   ├── schema.ts                          # NEW: SQL Server DDL
+│   │   ├── sqlserver-memory-repository.ts     # NEW: parameterized query implementation
+│   │   ├── sqlserver-consolidation-repository.ts # NEW
+│   │   ├── sqlserver-processed-file-repository.ts # NEW
+│   │   └── index.ts                           # NEW: barrel export
+│   │
+│   ├── azure-blob/
+│   │   ├── connection.ts                      # NEW: container client init
+│   │   ├── blob-helpers.ts                    # NEW: readJsonBlob, writeJsonBlob,
+│   │   │                                      #       readModifyWrite, time period utils
+│   │   ├── azure-blob-memory-repository.ts    # NEW: blob-based implementation
+│   │   ├── azure-blob-consolidation-repository.ts # NEW
+│   │   ├── azure-blob-processed-file-repository.ts # NEW
+│   │   └── index.ts                           # NEW: barrel export
+│   │
+│   └── index.ts                               # MODIFIED: exports interfaces, factory, sub-modules
+│
+├── llm/
+│   ├── provider-factory.ts                    # MODIFIED: accepts LlmConfig
+│   ├── types.ts                               # UNCHANGED
+│   ├── schemas.ts                             # UNCHANGED
+│   └── index.ts                               # MODIFIED: updated exports
+│
+├── agents/
+│   ├── ingest-agent.ts                        # MODIFIED: uses IMemoryRepository, async calls
+│   ├── consolidate-agent.ts                   # MODIFIED: uses IMemoryRepository, IConsolidationRepository
+│   ├── query-agent.ts                         # MODIFIED: uses IMemoryRepository, IConsolidationRepository
+│   └── index.ts                               # MODIFIED
+│
+├── api/
+│   ├── routes.ts                              # MODIFIED: await on all repo calls
+│   ├── types.ts                               # MODIFIED: references interface types
+│   ├── server.ts                              # MODIFIED: minor type updates
+│   └── index.ts                               # UNCHANGED
+│
+├── watcher/
+│   ├── file-watcher.ts                        # MODIFIED: uses IProcessedFileRepository, await
+│   └── index.ts                               # UNCHANGED
+│
+├── consolidation/
+│   ├── consolidation-loop.ts                  # MODIFIED: verify async compatibility
+│   └── index.ts                               # UNCHANGED
+│
+└── index.ts                                   # MODIFIED: uses StorageFactory, new config
+```
+
+#### E9.2 Deleted Files
+
+| File | Reason |
+|------|--------|
+| `src/database/memory-repository.ts` | Replaced by `src/database/sqlite/sqlite-memory-repository.ts` |
+| `src/database/consolidation-repository.ts` | Replaced by `src/database/sqlite/sqlite-consolidation-repository.ts` |
+| `src/database/processed-file-repository.ts` | Replaced by `src/database/sqlite/sqlite-processed-file-repository.ts` |
+| `src/database/connection.ts` | Replaced by `src/database/sqlite/connection.ts` |
+| `src/database/schema.ts` | Replaced by `src/database/sqlite/schema.ts` |
+
+#### E9.3 New npm Dependencies
+
+| Package | Dev? | Purpose |
+|---------|------|---------|
+| `js-yaml` | No | YAML file parsing |
+| `@types/js-yaml` | Yes | TypeScript definitions for js-yaml |
+| `mssql` | No | SQL Server client with connection pooling |
+| `@types/mssql` | Yes | TypeScript definitions for mssql |
+| `@azure/storage-blob` | No | Azure Blob Storage SDK |
+| `@azure/identity` | No | Azure Identity (DefaultAzureCredential) for azure-identity auth method |
+
+---
+
+### E10. Parallel Implementation Units
+
+The implementation is organized into units that can be built and verified independently, respecting the dependency graph from Plan 002.
+
+#### E10.1 Dependency Graph
+
+```
+Unit A: YAML Config Infra ──────────┬──────> Unit D: LLM Factory Update
+                                    │
+Unit B: Repository Interfaces ──────┤
+                                    │
+                                    ├──────> Unit C: SQLite Async Refactor
+                                    │               │
+                                    │               v
+                                    ├──────> Unit E: Consumer Async Migration
+                                    │               │
+                                    │               v
+                                    ├──────> Unit F: SQL Server Backend ──────┐
+                                    │                                        │
+                                    └──────> Unit G: Azure Blob Backend ─────┤
+                                                                             │
+                                                                             v
+                                                                      Unit H: Storage Factory
+                                                                             │
+                                                                             v
+                                                                      Unit I: Tests
+```
+
+#### E10.2 Parallel Groups
+
+| Group | Units | Can Run In Parallel | Rationale |
+|-------|-------|---------------------|-----------|
+| **Group 1** | A + B | Yes | YAML infrastructure and interface definitions have no shared dependencies |
+| **Group 2** | C (needs B) + D (needs A) | Yes | SQLite refactor needs interfaces; LLM factory needs config types. These are independent of each other |
+| **Group 3** | F + G (both need E) | Yes | SQL Server and Azure Blob backends are fully independent implementations of the same interfaces |
+
+#### E10.3 Unit Descriptions
+
+| Unit | Name | Input | Output | Estimated Effort |
+|------|------|-------|--------|------------------|
+| A | YAML Config Infrastructure | None | `yaml-loader.ts`, `storage-config-schema.ts`, `llm-config-schema.ts`, updated `types.ts`, `config.ts` | Small |
+| B | Repository Interface Definitions | None | `interfaces.ts` with all interfaces and `StorageBundle` | Small |
+| C | SQLite Async Refactor | Unit B | `src/database/sqlite/` directory with all files, old files deleted | Medium |
+| D | LLM Factory Update | Unit A | Updated `provider-factory.ts` accepting `LlmConfig` | Small |
+| E | Consumer Async Migration | Units C + D | All agents, routes, watcher updated with `await` and interface types | Medium-Large |
+| F | SQL Server Backend | Unit B + Unit E | `src/database/sqlserver/` directory with all files | Medium-Large |
+| G | Azure Blob Storage Backend | Unit B + Unit E | `src/database/azure-blob/` directory with all files | Large |
+| H | Storage Factory + Integration | Units F + G | `storage-factory.ts`, updated `src/index.ts` | Small |
+| I | Tests | Unit H | Test scripts in `test_scripts/` with YAML fixtures | Medium-Large |
+
+#### E10.4 Critical Path
+
+The critical path through the dependency graph is:
+
+**B -> C -> E -> G -> H -> I**
+
+This is the longest chain because Azure Blob (Unit G) is the most complex backend. SQL Server (Unit F) can run in parallel with G and is not on the critical path.
+
+#### E10.5 First Full-System Checkpoint
+
+After completing Units A + B + C + D + E, the application must be fully functional with the SQLite backend via `storage-config.yaml`. This is the first integration checkpoint before adding new backends. All HTTP endpoints, file watcher, and consolidation loop must work identically to v1.0 behavior.
+
+---
+
+### E11. Configuration Exception Registry
+
+Per project rules, optional fields that constitute exceptions to the no-fallback rule must be documented before implementation.
+
+| Field | Location | Type | Rationale |
+|-------|----------|------|-----------|
+| `llm.openai.organization` | `llm-config.yaml` | `string \| undefined` | Not all OpenAI accounts use organizations. Omitting means "use default organization." |
+| `llm.openai.baseUrl` | `llm-config.yaml` | `string \| undefined` | Only needed for Azure OpenAI or custom endpoints. Standard OpenAI API does not require it. |
+| `llm.anthropic.baseUrl` | `llm-config.yaml` | `string \| undefined` | Only needed for custom/proxy endpoints. Standard Anthropic API does not require it. |
+| `storage.azure-blob.connectionString` | `storage-config.yaml` | `string \| undefined` | Conditionally required: only when `authMethod = "connection-string"`. |
+| `storage.azure-blob.accountName` | `storage-config.yaml` | `string \| undefined` | Conditionally required: only when `authMethod = "azure-identity"`. |
+
+These exceptions are approved by user decision and must be recorded in the project memory file before implementation begins.

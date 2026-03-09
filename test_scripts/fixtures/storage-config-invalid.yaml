@@ -1,0 +1,3 @@
+storage:
+  provider: sqlite
+  # Missing sqlite section - provider section is absent

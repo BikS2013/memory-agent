@@ -27,13 +27,21 @@ The following configuration parameters are permitted to use default/fallback val
         3. Consolidation Loop -- periodic background task that synthesizes cross-memory insights
 
         Required environment variables (all mandatory, no defaults):
-        - LLM_PROVIDER: LLM provider to use ("openai" | "anthropic" | "google-genai")
-        - LLM_MODEL: Model identifier (e.g., "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash")
-        - LLM_API_KEY: API key for the chosen LLM provider
-        - DATABASE_PATH: Path to the SQLite database file (e.g., "./data/memory.db")
+        - STORAGE_CONFIG_PATH: Path to storage-config.yaml (storage backend configuration)
+        - LLM_CONFIG_PATH: Path to llm-config.yaml (LLM provider configuration)
         - WATCH_DIRECTORY: Directory to watch for new files (e.g., "./inbox")
         - API_PORT: Port number for the HTTP server (e.g., "8888")
         - CONSOLIDATION_INTERVAL_MS: Consolidation loop interval in milliseconds (e.g., "1800000")
+
+        Configuration files:
+        - storage-config.yaml: Defines storage backend (sqlite, sqlserver, or azure-blob) and its parameters
+        - llm-config.yaml: Defines LLM provider (openai, anthropic, or google) with model, temperature, and API key
+        - See storage-config.example.yaml and llm-config.example.yaml for templates
+
+        Supported storage backends:
+        - sqlite: Local SQLite database via better-sqlite3
+        - sqlserver: Microsoft SQL Server via mssql package with connection pooling
+        - azure-blob: Azure Blob Storage with JSON blobs, ETag concurrency, {userId}/{timePeriod}/{dataType}.json naming
 
         HTTP API endpoints:
         - GET  /status       -- Returns system status, uptime, and memory statistics
@@ -45,8 +53,8 @@ The following configuration parameters are permitted to use default/fallback val
         - POST /clear        -- Clears all memories and consolidations
 
         Examples:
-        # Start the server
-        LLM_PROVIDER=openai LLM_MODEL=gpt-4o LLM_API_KEY=sk-... DATABASE_PATH=./data/memory.db WATCH_DIRECTORY=./inbox API_PORT=8888 CONSOLIDATION_INTERVAL_MS=1800000 npx tsx src/index.ts
+        # Start the server with SQLite + OpenAI
+        STORAGE_CONFIG_PATH=./storage-config.yaml LLM_CONFIG_PATH=./llm-config.yaml WATCH_DIRECTORY=./inbox API_PORT=8888 CONSOLIDATION_INTERVAL_MS=1800000 npx tsx src/index.ts
 
         # Ingest a preference
         curl -X POST http://localhost:8888/ingest -H "Content-Type: application/json" -d '{"text": "I prefer dark mode in all applications", "source": "manual"}'

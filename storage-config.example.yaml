@@ -1,0 +1,29 @@
+# Storage Configuration for Always-On Memory Agent
+# Copy this file to storage-config.yaml and update values.
+# Set the STORAGE_CONFIG_PATH environment variable to the absolute path of your config file.
+
+storage:
+  # Active storage provider: "sqlite" | "sqlserver" | "azure-blob"
+  provider: "sqlite"
+
+  # SQLite configuration (required when provider is "sqlite")
+  sqlite:
+    databasePath: "./data/memories.db"
+
+  # SQL Server configuration (required when provider is "sqlserver")
+  # sqlserver:
+  #   server: "localhost"
+  #   port: 1433
+  #   database: "MemoryAgent"
+  #   user: "sa"
+  #   password: "your-password-here"
+  #   encrypt: true
+  #   trustServerCertificate: false
+
+  # Azure Blob Storage configuration (required when provider is "azure-blob")
+  # azure-blob:
+  #   authMethod: "connection-string"  # or "azure-identity"
+  #   connectionString: "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+  #   accountName: "mystorageaccount"  # required when authMethod is "azure-identity"
+  #   containerName: "memories"
+  #   timePeriodFormat: "monthly"      # "monthly" | "weekly" | "daily"

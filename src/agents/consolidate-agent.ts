@@ -7,8 +7,7 @@ import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ConsolidationResultSchema } from '../llm/schemas.js';
 import { CONSOLIDATE_SYSTEM_PROMPT } from '../llm/prompts.js';
-import type { MemoryRepository } from '../database/memory-repository.js';
-import type { ConsolidationRepository } from '../database/consolidation-repository.js';
+import type { IMemoryRepository, IConsolidationRepository } from '../database/interfaces.js';
 import type { ConsolidationRow, MemoryRow } from '../database/types.js';
 import type { ConsolidationResult } from '../llm/types.js';
 
@@ -20,13 +19,13 @@ export interface ConsolidateResult {
 
 export class ConsolidateAgent {
   private readonly llm: BaseChatModel;
-  private readonly memoryRepo: MemoryRepository;
-  private readonly consolidationRepo: ConsolidationRepository;
+  private readonly memoryRepo: IMemoryRepository;
+  private readonly consolidationRepo: IConsolidationRepository;
 
   constructor(
     llm: BaseChatModel,
-    memoryRepo: MemoryRepository,
-    consolidationRepo: ConsolidationRepository
+    memoryRepo: IMemoryRepository,
+    consolidationRepo: IConsolidationRepository
   ) {
     this.llm = llm;
     this.memoryRepo = memoryRepo;
@@ -43,7 +42,7 @@ export class ConsolidateAgent {
   async consolidate(userId?: string): Promise<ConsolidateResult> {
     const resolvedUserId = userId ?? 'default';
 
-    const unconsolidated = this.memoryRepo.getUnconsolidated();
+    const unconsolidated = await this.memoryRepo.getUnconsolidated();
 
     if (unconsolidated.length < 2) {
       return { consolidated: false, memoriesProcessed: 0, consolidation: null };
@@ -66,14 +65,14 @@ export class ConsolidateAgent {
 
     const memoryIds = unconsolidated.map((m) => m.id);
 
-    const consolidation = this.consolidationRepo.insert({
+    const consolidation = await this.consolidationRepo.insert({
       userId: resolvedUserId,
       sourceIds: JSON.stringify(memoryIds),
       summary: result.summary,
       insight: result.insight,
     });
 
-    this.memoryRepo.markConsolidated(memoryIds);
+    await this.memoryRepo.markConsolidated(memoryIds);
 
     return {
       consolidated: true,

@@ -12,6 +12,13 @@ export type {
   MemoryStats,
 } from './types.js';
 
+export type {
+  IMemoryRepository,
+  IConsolidationRepository,
+  IProcessedFileRepository,
+  StorageBundle,
+} from './interfaces.js';
+
 export {
   CREATE_MEMORY_TABLE,
   CREATE_CONSOLIDATION_TABLE,
@@ -23,8 +30,13 @@ export {
   ALL_SCHEMA_STATEMENTS,
 } from './schema.js';
 
-export { initializeDatabase, closeDatabase } from './connection.js';
+export {
+  initializeDatabase,
+  closeDatabase,
+  SqliteMemoryRepository,
+  SqliteConsolidationRepository,
+  SqliteProcessedFileRepository,
+  createSqliteStorage,
+} from './sqlite/index.js';
 
-export { MemoryRepository } from './memory-repository.js';
-export { ConsolidationRepository } from './consolidation-repository.js';
-export { ProcessedFileRepository } from './processed-file-repository.js';
+export { createStorage } from './storage-factory.js';

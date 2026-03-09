@@ -11,19 +11,19 @@ import * as path from 'node:path';
 import chokidar from 'chokidar';
 import type { FSWatcher } from 'chokidar';
 import type { IngestAgent } from '../agents/ingest-agent.js';
-import type { ProcessedFileRepository } from '../database/processed-file-repository.js';
+import type { IProcessedFileRepository } from '../database/interfaces.js';
 import { SUPPORTED_EXTENSIONS } from './types.js';
 
 export class FileWatcher {
   private readonly watchDirectory: string;
   private readonly ingestAgent: IngestAgent;
-  private readonly processedFileRepo: ProcessedFileRepository;
+  private readonly processedFileRepo: IProcessedFileRepository;
   private watcher: FSWatcher | null = null;
 
   constructor(
     watchDirectory: string,
     ingestAgent: IngestAgent,
-    processedFileRepo: ProcessedFileRepository,
+    processedFileRepo: IProcessedFileRepository,
   ) {
     this.watchDirectory = watchDirectory;
     this.ingestAgent = ingestAgent;
@@ -80,7 +80,7 @@ export class FileWatcher {
       return;
     }
 
-    if (this.processedFileRepo.isProcessed(filePath)) {
+    if (await this.processedFileRepo.isProcessed(filePath)) {
       console.log(`[FileWatcher] Already processed, skipping: ${filePath}`);
       return;
     }
@@ -89,7 +89,7 @@ export class FileWatcher {
 
     await this.ingestAgent.ingest(content, filePath);
 
-    this.processedFileRepo.markProcessed(filePath);
+    await this.processedFileRepo.markProcessed(filePath);
 
     console.log(`[FileWatcher] Successfully processed: ${filePath}`);
   }

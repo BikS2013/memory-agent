@@ -5,8 +5,7 @@
 import type { IngestAgent } from '../agents/ingest-agent.js';
 import type { ConsolidateAgent } from '../agents/consolidate-agent.js';
 import type { QueryAgent } from '../agents/query-agent.js';
-import type { MemoryRepository } from '../database/memory-repository.js';
-import type { ConsolidationRepository } from '../database/consolidation-repository.js';
+import type { IMemoryRepository, IConsolidationRepository } from '../database/interfaces.js';
 
 /**
  * Dependencies required by the API server and route handlers.
@@ -15,8 +14,8 @@ export interface ServerDependencies {
   readonly ingestAgent: IngestAgent;
   readonly consolidateAgent: ConsolidateAgent;
   readonly queryAgent: QueryAgent;
-  readonly memoryRepo: MemoryRepository;
-  readonly consolidationRepo: ConsolidationRepository;
+  readonly memoryRepo: IMemoryRepository;
+  readonly consolidationRepo: IConsolidationRepository;
 }
 
 /**

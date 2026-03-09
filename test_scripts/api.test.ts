@@ -8,8 +8,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import Database from 'better-sqlite3';
 import { registerRoutes } from '../src/api/routes.js';
-import { MemoryRepository } from '../src/database/memory-repository.js';
-import { ConsolidationRepository } from '../src/database/consolidation-repository.js';
+import { SqliteMemoryRepository } from '../src/database/sqlite/sqlite-memory-repository.js';
+import { SqliteConsolidationRepository } from '../src/database/sqlite/sqlite-consolidation-repository.js';
 import { ALL_SCHEMA_STATEMENTS } from '../src/database/schema.js';
 import type { ServerDependencies } from '../src/api/types.js';
 import type { MemoryRow } from '../src/database/types.js';
@@ -72,8 +72,8 @@ function createMockQueryAgent(): QueryAgent {
 describe('HTTP API Routes', () => {
   let server: FastifyInstance;
   let db: Database.Database;
-  let memoryRepo: MemoryRepository;
-  let consolidationRepo: ConsolidationRepository;
+  let memoryRepo: SqliteMemoryRepository;
+  let consolidationRepo: SqliteConsolidationRepository;
 
   beforeEach(() => {
     db = new Database(':memory:');
@@ -81,8 +81,8 @@ describe('HTTP API Routes', () => {
       db.exec(stmt);
     }
 
-    memoryRepo = new MemoryRepository(db);
-    consolidationRepo = new ConsolidationRepository(db);
+    memoryRepo = new SqliteMemoryRepository(db);
+    consolidationRepo = new SqliteConsolidationRepository(db);
 
     const deps: ServerDependencies = {
       ingestAgent: createMockIngestAgent(),
@@ -257,7 +257,7 @@ describe('HTTP API Routes', () => {
 
   it('POST /delete with existing id returns 200 with deleted true', async () => {
     // Insert a real memory first
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test',
       summary: 'test summary',
@@ -295,7 +295,7 @@ describe('HTTP API Routes', () => {
 
   it('POST /clear after inserting data returns correct counts', async () => {
     // Insert some data
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test1',
       summary: 'summary1',
@@ -303,7 +303,7 @@ describe('HTTP API Routes', () => {
       topics: '[]',
       importance: 0.5,
     });
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test2',
       summary: 'summary2',

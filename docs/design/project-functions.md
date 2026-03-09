@@ -2,7 +2,7 @@
 
 **Project**: TypeScript Always-On Memory Agent for User Preference Persistence
 **Created**: 2026-03-09
-**Last Updated**: 2026-03-09
+**Last Updated**: 2026-03-09 (Updated with Plan 002 multi-storage and YAML config requirements)
 
 ---
 
@@ -223,18 +223,209 @@ All configuration parameters must be loaded from environment variables. Missing 
 
 ## Feature Summary Matrix
 
-| Feature | FR | Phase | Priority | Status |
-|---------|-----|-------|----------|--------|
-| Memory Ingestion | FR-01 | 3, 4 | Critical | Planned |
-| Memory Consolidation | FR-02 | 3, 6 | Critical | Planned |
-| Memory Query | FR-03 | 3, 4 | Critical | Planned |
-| File Watching | FR-04 | 5 | High | Planned |
-| Memory Management (CRUD) | FR-05 | 2, 4 | High | Planned |
-| HTTP API | FR-06 | 4 | Critical | Planned |
-| User Preference Focus | FR-07 | 3 | High | Planned |
-| Agent Integration SDK | FR-08 | 7 | High | Planned |
-| Configuration Management | FR-09 | 1 | Critical | Planned |
-| Graceful Startup/Shutdown | FR-10 | 7 | High | Planned |
+| Feature | FR | Plan / Phase | Priority | Status |
+|---------|-----|-------------|----------|--------|
+| Memory Ingestion | FR-01 | Plan 001 / 3, 4 | Critical | Planned |
+| Memory Consolidation | FR-02 | Plan 001 / 3, 6 | Critical | Planned |
+| Memory Query | FR-03 | Plan 001 / 3, 4 | Critical | Planned |
+| File Watching | FR-04 | Plan 001 / 5 | High | Planned |
+| Memory Management (CRUD) | FR-05 | Plan 001 / 2, 4 | High | Planned |
+| HTTP API | FR-06 | Plan 001 / 4 | Critical | Planned |
+| User Preference Focus | FR-07 | Plan 001 / 3 | High | Planned |
+| Agent Integration SDK | FR-08 | Plan 001 / 7 | High | Planned |
+| Configuration Management | FR-09 | Plan 001 / 1 | Critical | Planned |
+| Graceful Startup/Shutdown | FR-10 | Plan 001 / 7 | High | Planned |
+| Multi-Storage Backend Support | FR-11 | Plan 002 / 2,3,6,7,8 | Critical | Planned |
+| Storage Config via YAML | FR-12 | Plan 002 / 1 | Critical | Planned |
+| LLM Config via YAML | FR-13 | Plan 002 / 1 | Critical | Planned |
+| SQL Server Backend | FR-14 | Plan 002 / 6 | High | Planned |
+| Azure Blob Storage Backend | FR-15 | Plan 002 / 7 | High | Planned |
+| Configuration Overhaul | FR-16 | Plan 002 / 1, 5 | Critical | Planned |
+| Sync-to-Async Migration | FR-17 | Plan 002 / 3, 5 | Critical | Planned |
+
+---
+
+### FR-11: Multi-Storage Backend Support
+
+**Priority**: Critical
+**Phase**: Plan 002 -- Phases 2, 3, 6, 7, 8
+
+The system must support multiple storage backends through a repository interface abstraction pattern. Only one storage backend is active at any time, selected via `storage-config.yaml`.
+
+**Supported backends**:
+
+| Backend | Package | Description |
+|---------|---------|-------------|
+| SQLite | `better-sqlite3` | Current backend, refactored to implement async interfaces |
+| SQL Server | `mssql` | Relational backend with connection pooling, parameterized queries, and schema auto-initialization |
+| Azure Blob Storage | `@azure/storage-blob` | Document-oriented backend using JSON blobs keyed by `{userId}/{timePeriod}/{dataType}.json` |
+
+**Repository interfaces** (all async, returning `Promise<T>`):
+- `IMemoryRepository` -- 9 methods: insert, getAll, getById, getUnconsolidated, markConsolidated, updateConnections, deleteById, deleteAll, getStats
+- `IConsolidationRepository` -- 4 methods: insert, getAll, deleteAll, getCount
+- `IProcessedFileRepository` -- 3 methods: isProcessed, markProcessed, getAll
+
+**StorageFactory**: A factory class reads `storage-config.yaml` and instantiates the correct backend, returning a `StorageBundle` containing all three repository instances and a `close()` method.
+
+**Constraints**:
+- All repository methods are async to accommodate SQL Server and Azure Blob (SQLite wraps sync calls in async)
+- Database tables use singular names: `Memory`, `Consolidation`, `ProcessedFile`
+- No data migration tooling between backends (out of scope)
+- No multi-backend simultaneous usage
+
+---
+
+### FR-12: Storage Configuration via YAML (storage-config.yaml)
+
+**Priority**: Critical
+**Phase**: Plan 002 -- Phase 1
+
+The system must load storage backend configuration from a dedicated YAML file (`storage-config.yaml`). The file path is specified via the `STORAGE_CONFIG_PATH` environment variable.
+
+**YAML structure**:
+```yaml
+storage:
+  provider: "sqlite" | "sqlserver" | "azure-blob"
+  sqlite:
+    databasePath: <string>
+  sqlserver:
+    server: <string>
+    port: <number>
+    database: <string>
+    user: <string>
+    password: <string>
+    encrypt: <boolean>
+    trustServerCertificate: <boolean>
+  azure-blob:
+    connectionString: <string>
+    containerName: <string>
+    timePeriodFormat: "monthly" | "weekly" | "daily"
+```
+
+**Validation rules**:
+- Only the section matching the active `provider` is validated
+- All fields in the active provider section are mandatory -- missing fields raise an exception at startup
+- No defaults, no fallbacks
+- Parsed and validated using `js-yaml` + Zod schemas
+
+---
+
+### FR-13: LLM Configuration via YAML (llm-config.yaml)
+
+**Priority**: Critical
+**Phase**: Plan 002 -- Phase 1
+
+The system must load LLM provider configuration from a dedicated YAML file (`llm-config.yaml`). The file path is specified via the `LLM_CONFIG_PATH` environment variable. This replaces the previous `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY` environment variables.
+
+**YAML structure**:
+```yaml
+llm:
+  provider: "openai" | "anthropic" | "google"
+  temperature: <number>     # Required, 0.0 - 2.0
+  model: <string>           # Required
+  openai:
+    apiKey: <string>        # Required when provider=openai
+    organization: <string>  # Optional
+    baseUrl: <string>       # Optional
+  anthropic:
+    apiKey: <string>        # Required when provider=anthropic
+    baseUrl: <string>       # Optional
+  google:
+    apiKey: <string>        # Required when provider=google
+```
+
+**Validation rules**:
+- Only the section matching the active `provider` is validated
+- All required fields in the active section are mandatory -- missing required fields raise an exception at startup
+- `organization` and `baseUrl` are explicitly optional
+- `temperature` and `model` are shared across providers (top-level)
+- No defaults, no fallbacks
+
+---
+
+### FR-14: SQL Server Backend
+
+**Priority**: High
+**Phase**: Plan 002 -- Phase 6
+
+The system must implement a SQL Server storage backend using the `mssql` npm package that implements all three repository interfaces (`IMemoryRepository`, `IConsolidationRepository`, `IProcessedFileRepository`).
+
+**Requirements**:
+- Connection pooling must be used for all database connections
+- Schema initialization (table and index creation) must be handled automatically on first connection using `IF OBJECT_ID(...) IS NULL` pattern
+- All queries must use parameterized inputs (`.input()`) to prevent SQL injection
+- `markConsolidated()` must execute within a transaction for atomicity
+- Text fields must use `NVARCHAR(MAX)` for Unicode support
+- JSON array fields (entities, topics, connections, sourceIds) stored as serialized NVARCHAR(MAX) strings
+
+**Configuration**: `server`, `port`, `database`, `user`, `password`, `encrypt`, `trustServerCertificate` -- all mandatory.
+
+---
+
+### FR-15: Azure Blob Storage Backend
+
+**Priority**: High
+**Phase**: Plan 002 -- Phase 7
+
+The system must implement an Azure Blob Storage backend using `@azure/storage-blob` that implements all three repository interfaces.
+
+**Blob naming convention**: `{userId}/{timePeriod}/{dataType}.json`
+- `userId`: User identifier (e.g., "default")
+- `timePeriod`: Time bucket based on `timePeriodFormat` config ("2026-03" for monthly, "2026-W10" for weekly, "2026-03-09" for daily)
+- `dataType`: "memories", "consolidations", or "processed-files"
+
+**Special behaviors**:
+- Each blob stores a JSON array of records; mutations use read-modify-write pattern
+- ETag-based optimistic concurrency with up to 3 retries on conflict
+- `getAll()` and `getUnconsolidated()` scan ALL time-period blobs for the user
+- ProcessedFile is stored in a single blob per user (`{userId}/processed-files.json`) without time bucketing
+- Auto-ID generation: `max(existing IDs) + 1`
+- Missing/non-existent blobs are treated as empty arrays
+
+**Configuration**: `connectionString`, `containerName`, `timePeriodFormat` -- all mandatory.
+
+---
+
+### FR-16: Configuration Management Overhaul
+
+**Priority**: Critical
+**Phase**: Plan 002 -- Phases 1, 5
+
+The configuration management system must be restructured to use YAML files for storage and LLM configuration while retaining environment variables for operational settings.
+
+**Final environment variables**:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `STORAGE_CONFIG_PATH` | string | Absolute path to `storage-config.yaml` |
+| `LLM_CONFIG_PATH` | string | Absolute path to `llm-config.yaml` |
+| `WATCH_DIRECTORY` | string | Path to the inbox directory for file watcher |
+| `API_PORT` | number | HTTP server port |
+| `CONSOLIDATION_INTERVAL_MS` | number | Consolidation loop timer interval |
+
+**Removed environment variables**: `LLM_PROVIDER`, `LLM_MODEL`, `LLM_API_KEY`, `DATABASE_PATH`
+
+**AppConfig restructure**: The `AppConfig` interface must be updated from flat fields to nested structure containing `storage: StorageConfig`, `llm: LlmConfig`, plus the three remaining env-var fields.
+
+---
+
+### FR-17: Sync-to-Async Repository Migration
+
+**Priority**: Critical
+**Phase**: Plan 002 -- Phases 3, 5
+
+All repository interfaces must use async methods (returning `Promise<T>`) to accommodate inherently async backends (SQL Server, Azure Blob Storage). This requires:
+
+- SQLite repositories wrapped in async functions (implicit Promise wrapping via `async` keyword)
+- All 6 consumer modules updated to `await` repository calls:
+  - `IngestAgent` -- awaits `memoryRepo.insert()`
+  - `ConsolidateAgent` -- awaits `memoryRepo.getUnconsolidated()`, `memoryRepo.markConsolidated()`, `consolidationRepo.insert()`
+  - `QueryAgent` -- awaits `memoryRepo.getAll()`, `consolidationRepo.getAll()`
+  - `FileWatcher` -- awaits `processedFileRepo.isProcessed()`, `processedFileRepo.markProcessed()`
+  - `routes.ts` -- awaits all repository calls in route handlers
+  - `api/types.ts` -- references interface types instead of concrete classes
+
+**Constraint**: All consumers must reference interface types (`IMemoryRepository`, `IConsolidationRepository`, `IProcessedFileRepository`), not concrete backend classes.
 
 ---
 
@@ -265,3 +456,14 @@ All configuration parameters must be loaded from environment variables. Missing 
 | AC-08 | All tools documented in CLAUDE.md with XML format | Project convention |
 | AC-09 | System handles 50+ memories without query performance degradation | FR-03 |
 | AC-10 | GET /status returns accurate counts | FR-05 |
+| AC-11 | Agent starts with storage-config.yaml provider=sqlite; all existing behavior unchanged | FR-11, FR-12 |
+| AC-12 | Agent starts with storage-config.yaml provider=sqlserver; all CRUD operations work | FR-11, FR-14 |
+| AC-13 | Agent starts with storage-config.yaml provider=azure-blob; all CRUD operations work | FR-11, FR-15 |
+| AC-14 | Azure Blob memories for user "john" in March 2026 (monthly) stored at john/2026-03/memories.json | FR-15 |
+| AC-15 | Agent starts with llm-config.yaml for each provider (openai, anthropic, google) | FR-13 |
+| AC-16 | Missing or malformed storage-config.yaml throws a clear error at startup | FR-12 |
+| AC-17 | Missing or malformed llm-config.yaml throws a clear error at startup | FR-13 |
+| AC-18 | Missing STORAGE_CONFIG_PATH or LLM_CONFIG_PATH env var throws clear error | FR-16 |
+| AC-19 | Env vars LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, DATABASE_PATH are no longer read | FR-16 |
+| AC-20 | All HTTP endpoints work identically regardless of active storage backend | FR-11 |
+| AC-21 | Client SDK works without changes after multi-storage migration | FR-08, FR-11 |

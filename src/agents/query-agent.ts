@@ -7,8 +7,7 @@ import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { QueryResultSchema } from '../llm/schemas.js';
 import { QUERY_SYSTEM_PROMPT } from '../llm/prompts.js';
-import type { MemoryRepository } from '../database/memory-repository.js';
-import type { ConsolidationRepository } from '../database/consolidation-repository.js';
+import type { IMemoryRepository, IConsolidationRepository } from '../database/interfaces.js';
 import type { MemoryRow, ConsolidationRow } from '../database/types.js';
 import type { QueryResult } from '../llm/types.js';
 
@@ -22,13 +21,13 @@ export interface QueryResponse {
 
 export class QueryAgent {
   private readonly llm: BaseChatModel;
-  private readonly memoryRepo: MemoryRepository;
-  private readonly consolidationRepo: ConsolidationRepository;
+  private readonly memoryRepo: IMemoryRepository;
+  private readonly consolidationRepo: IConsolidationRepository;
 
   constructor(
     llm: BaseChatModel,
-    memoryRepo: MemoryRepository,
-    consolidationRepo: ConsolidationRepository
+    memoryRepo: IMemoryRepository,
+    consolidationRepo: IConsolidationRepository
   ) {
     this.llm = llm;
     this.memoryRepo = memoryRepo;
@@ -44,8 +43,8 @@ export class QueryAgent {
    */
   async query(question: string, _userId?: string): Promise<QueryResponse> {
     // _userId reserved for future multi-tenant filtering
-    const memories = this.memoryRepo.getAll();
-    const consolidations = this.consolidationRepo.getAll();
+    const memories = await this.memoryRepo.getAll();
+    const consolidations = await this.consolidationRepo.getAll();
 
     const context = this.formatContext(memories, consolidations);
 

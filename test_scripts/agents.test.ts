@@ -9,8 +9,8 @@ import Database from 'better-sqlite3';
 import { IngestAgent } from '../src/agents/ingest-agent.js';
 import { ConsolidateAgent } from '../src/agents/consolidate-agent.js';
 import { QueryAgent } from '../src/agents/query-agent.js';
-import { MemoryRepository } from '../src/database/memory-repository.js';
-import { ConsolidationRepository } from '../src/database/consolidation-repository.js';
+import { SqliteMemoryRepository } from '../src/database/sqlite/sqlite-memory-repository.js';
+import { SqliteConsolidationRepository } from '../src/database/sqlite/sqlite-consolidation-repository.js';
 import { ALL_SCHEMA_STATEMENTS } from '../src/database/schema.js';
 import type { MemoryExtraction } from '../src/llm/types.js';
 import type { ConsolidationResult } from '../src/llm/types.js';
@@ -58,14 +58,14 @@ const fakeQueryResult: QueryResult = {
 
 describe('IngestAgent', () => {
   let db: Database.Database;
-  let memoryRepo: MemoryRepository;
+  let memoryRepo: SqliteMemoryRepository;
 
   beforeEach(() => {
     db = new Database(':memory:');
     for (const stmt of ALL_SCHEMA_STATEMENTS) {
       db.exec(stmt);
     }
-    memoryRepo = new MemoryRepository(db);
+    memoryRepo = new SqliteMemoryRepository(db);
   });
 
   afterEach(() => {
@@ -87,7 +87,7 @@ describe('IngestAgent', () => {
     expect(result.userId).toBe('default');
 
     // Verify it was persisted
-    const allMemories = memoryRepo.getAll();
+    const allMemories = await memoryRepo.getAll();
     expect(allMemories).toHaveLength(1);
     expect(allMemories[0]!.id).toBe(1);
   });
@@ -116,16 +116,16 @@ describe('IngestAgent', () => {
 
 describe('ConsolidateAgent', () => {
   let db: Database.Database;
-  let memoryRepo: MemoryRepository;
-  let consolidationRepo: ConsolidationRepository;
+  let memoryRepo: SqliteMemoryRepository;
+  let consolidationRepo: SqliteConsolidationRepository;
 
   beforeEach(() => {
     db = new Database(':memory:');
     for (const stmt of ALL_SCHEMA_STATEMENTS) {
       db.exec(stmt);
     }
-    memoryRepo = new MemoryRepository(db);
-    consolidationRepo = new ConsolidationRepository(db);
+    memoryRepo = new SqliteMemoryRepository(db);
+    consolidationRepo = new SqliteConsolidationRepository(db);
   });
 
   afterEach(() => {
@@ -143,7 +143,7 @@ describe('ConsolidateAgent', () => {
     expect(result0.consolidation).toBeNull();
 
     // Only 1 memory
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test',
       summary: 'test summary',
@@ -163,7 +163,7 @@ describe('ConsolidateAgent', () => {
     const agent = new ConsolidateAgent(mockLlm, memoryRepo, consolidationRepo);
 
     // Insert 2 memories
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'I prefer dark mode',
       summary: 'User prefers dark mode',
@@ -171,7 +171,7 @@ describe('ConsolidateAgent', () => {
       topics: '["ui-preferences"]',
       importance: 0.8,
     });
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'I like minimal UI',
       summary: 'User likes minimal UI',
@@ -189,11 +189,11 @@ describe('ConsolidateAgent', () => {
     expect(result.consolidation!.insight).toBe(fakeConsolidationResult.insight);
 
     // Verify memories are now marked consolidated
-    const unconsolidated = memoryRepo.getUnconsolidated();
+    const unconsolidated = await memoryRepo.getUnconsolidated();
     expect(unconsolidated).toHaveLength(0);
 
     // Verify consolidation was persisted
-    const allConsolidations = consolidationRepo.getAll();
+    const allConsolidations = await consolidationRepo.getAll();
     expect(allConsolidations).toHaveLength(1);
   });
 
@@ -207,7 +207,7 @@ describe('ConsolidateAgent', () => {
     const agent = new ConsolidateAgent(failingLlm, memoryRepo, consolidationRepo);
 
     // Need 2+ memories to trigger LLM call
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test1',
       summary: 'summary1',
@@ -215,7 +215,7 @@ describe('ConsolidateAgent', () => {
       topics: '[]',
       importance: 0.5,
     });
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'test2',
       summary: 'summary2',
@@ -230,16 +230,16 @@ describe('ConsolidateAgent', () => {
 
 describe('QueryAgent', () => {
   let db: Database.Database;
-  let memoryRepo: MemoryRepository;
-  let consolidationRepo: ConsolidationRepository;
+  let memoryRepo: SqliteMemoryRepository;
+  let consolidationRepo: SqliteConsolidationRepository;
 
   beforeEach(() => {
     db = new Database(':memory:');
     for (const stmt of ALL_SCHEMA_STATEMENTS) {
       db.exec(stmt);
     }
-    memoryRepo = new MemoryRepository(db);
-    consolidationRepo = new ConsolidationRepository(db);
+    memoryRepo = new SqliteMemoryRepository(db);
+    consolidationRepo = new SqliteConsolidationRepository(db);
   });
 
   afterEach(() => {
@@ -251,7 +251,7 @@ describe('QueryAgent', () => {
     const agent = new QueryAgent(mockLlm, memoryRepo, consolidationRepo);
 
     // Insert a memory so context is non-empty
-    memoryRepo.insert({
+    await memoryRepo.insert({
       source: 'api',
       rawText: 'I prefer dark mode',
       summary: 'User prefers dark mode',

@@ -7,15 +7,15 @@ import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { MemoryExtractionSchema } from '../llm/schemas.js';
 import { INGEST_SYSTEM_PROMPT } from '../llm/prompts.js';
-import type { MemoryRepository } from '../database/memory-repository.js';
+import type { IMemoryRepository } from '../database/interfaces.js';
 import type { MemoryRow } from '../database/types.js';
 import type { MemoryExtraction } from '../llm/types.js';
 
 export class IngestAgent {
   private readonly llm: BaseChatModel;
-  private readonly memoryRepo: MemoryRepository;
+  private readonly memoryRepo: IMemoryRepository;
 
-  constructor(llm: BaseChatModel, memoryRepo: MemoryRepository) {
+  constructor(llm: BaseChatModel, memoryRepo: IMemoryRepository) {
     this.llm = llm;
     this.memoryRepo = memoryRepo;
   }
@@ -55,6 +55,6 @@ export class IngestAgent {
       importance: extraction.importance,
     };
 
-    return this.memoryRepo.insert(newMemory);
+    return await this.memoryRepo.insert(newMemory);
   }
 }

@@ -1,0 +1,6 @@
+llm:
+  provider: openai
+  temperature: 0.7
+  model: gpt-4
+  openai:
+    apiKey: sk-test-key-12345

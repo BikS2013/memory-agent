@@ -1,43 +1,16 @@
 import type { AppConfig } from './types.js';
-import { VALID_LLM_PROVIDERS } from './types.js';
 
 /**
- * Validates the loaded configuration object.
+ * Validates the operational fields of the loaded configuration object.
+ * Storage and LLM configuration are validated by their respective Zod schemas.
+ * This function validates only the remaining environment-sourced fields.
+ *
  * Throws on any invalid value. No defaults. No fallbacks.
  *
  * @param config - The loaded AppConfig to validate
  * @throws Error with a descriptive message for each validation failure
  */
 export function validateConfig(config: AppConfig): void {
-  // Validate LLM provider
-  if (!VALID_LLM_PROVIDERS.includes(config.llmProvider)) {
-    throw new Error(
-      `Invalid LLM_PROVIDER: "${config.llmProvider}". ` +
-      `Must be one of: ${VALID_LLM_PROVIDERS.join(', ')}`
-    );
-  }
-
-  // Validate llmModel is non-empty
-  if (typeof config.llmModel !== 'string' || config.llmModel.trim() === '') {
-    throw new Error(
-      'Invalid LLM_MODEL: must be a non-empty string.'
-    );
-  }
-
-  // Validate llmApiKey is non-empty
-  if (typeof config.llmApiKey !== 'string' || config.llmApiKey.trim() === '') {
-    throw new Error(
-      'Invalid LLM_API_KEY: must be a non-empty string.'
-    );
-  }
-
-  // Validate databasePath is non-empty
-  if (typeof config.databasePath !== 'string' || config.databasePath.trim() === '') {
-    throw new Error(
-      'Invalid DATABASE_PATH: must be a non-empty string.'
-    );
-  }
-
   // Validate watchDirectory is non-empty
   if (typeof config.watchDirectory !== 'string' || config.watchDirectory.trim() === '') {
     throw new Error(
