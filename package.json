@@ -1,0 +1,36 @@
+{
+  "name": "always-memory-on",
+  "version": "1.0.0",
+  "description": "TypeScript Always-On Memory Agent for capturing and consolidating user preferences",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./client": "./dist/client/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">= 18.0.0"
+  },
+  "dependencies": {
+    "@langchain/core": "latest",
+    "@langchain/openai": "latest",
+    "@langchain/anthropic": "latest",
+    "@langchain/google-genai": "latest",
+    "better-sqlite3": "^12.0.0",
+    "fastify": "^5.0.0",
+    "chokidar": "^4.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0",
+    "tsx": "latest",
+    "@types/node": "^22.0.0",
+    "@types/better-sqlite3": "latest",
+    "vitest": "latest"
+  }
+}
